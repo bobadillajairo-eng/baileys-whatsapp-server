@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp CRM Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .sidebar {
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .sidebar a {
+            color: rgba(255,255,255,0.8);
+            text-decoration: none;
+            padding: 10px 15px;
+            display: block;
+            transition: all 0.3s;
+        }
+        .sidebar a:hover, .sidebar a.active {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border-radius: 5px;
+        }
+        .main-content {
+            background: #f8f9fa;
+            min-height: 100vh;
+        }
+        .card-stats {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .contact-card {
+            transition: transform 0.2s;
+            cursor: pointer;
+        }
+        .contact-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+        }
+        .tag {
+            display: inline-block;
+            background: #e9ecef;
+            padding: 2px 8px;
+            border-radius: 15px;
+            font-size: 12px;
+            margin: 2px;
+        }
+        .message-bubble {
+            background: white;
+            border-radius: 10px;
+            padding: 10px;
+            margin: 5px 0;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        }
+        .message-bubble.incoming {
+            border-left: 3px solid #28a745;
+        }
+        .message-bubble.outgoing {
+            border-left: 3px solid #007bff;
+            background: #f0f7ff;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <div class="col-md-2 p-0 sidebar">
+                <div class="p-3">
+                    <h4><i class="bi bi-whatsapp"></i> WhatsApp CRM</h4>
+                    <hr class="bg-light">
+                </div>
+                <nav class="nav flex-column">
+                    <a class="nav-link active" href="#" data-page="dashboard">
+                        <i class="bi bi-speedometer2"></i> Dashboard
+                    </a>
+                    <a class="nav-link" href="#" data-page="contacts">
+                        <i class="bi bi-people"></i> Contacts
+                    </a>
+                    <a class="nav-link" href="#" data-page="conversations">
+                        <i class="bi bi-chat-dots"></i> Conversations
+                    </a>
+                    <a class="nav-link" href="#" data-page="campaigns">
+                        <i class="bi bi-megaphone"></i> Campaigns
+                    </a>
+                    <a class="nav-link" href="#" data-page="templates">
+                        <i class="bi bi-file-text"></i> Templates
+                    </a>
+                    <a class="nav-link" href="#" data-page="analytics">
+                        <i class="bi bi-graph-up"></i> Analytics
+                    </a>
+                    <a class="nav-link" href="#" data-page="settings">
+                        <i class="bi bi-gear"></i> Settings
+                    </a>
+                </nav>
+            </div>
+            
+            <!-- Main Content -->
+            <div class="col-md-10 main-content p-4">
+                <div id="loading" class="loading">
+                    <div class="spinner-border text-primary" role="status"></div>
+                    <p>Loading...</p>
+                </div>
+                <div id="page-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const API_KEY = prompt('Enter API Secret Key:');
+        
+        // Global state
+        let currentPage = 'dashboard';
+        let contacts = [];
+        let analytics = null;
+        
+        // API Helper
+        async function apiCall(endpoint, options = {}) {
+            const defaultOptions = {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-secret': API_KEY
+                }
+            };
+            
+            const response = await fetch(`/api/crm/${endpoint}`, { ...defaultOptions, ...options });
+            return await response.json();
+        }
+        
+        // Page rendering functions
+        async function loadDashboard() {
+            showLoading(true);
+            try {
+                const analytics = await apiCall('analytics');
+                const recentContacts = await apiCall('contacts?limit=5');
+                const recentConv = await apiCall('conversations?limit=5');
+                
+                const html = `
+                    <h2><i class="bi bi-speedometer2"></i> Dashboard</h2>
+                    <hr>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-3">
+                            <div class="card card-stats">
+                                <div class="card-body">
+                                    <h5 class="card-title">Total Contacts</h5>
+                                    <h2>${analytics.total_contacts || 0}</h2>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card card-stats">
+                                <div class="card-body">
+                                    <h5 class="card-title">Total Messages</h5>
+                                    <h2>${analytics.total_messages || 0}</h2>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card card-stats">
+                                <div class="card-body">
+                                    <h5 class="card-title">Active Today</h5>
+                                    <h2>${analytics.active_today || 0}</h2>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card card-stats">
+                                <div class="card-body">
+                                    <h5 class="card-title">WhatsApp Status</h5>
+                                    <h2><span class="badge bg-success">Connected</span></h2>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Recent Contacts</h5>
+                                </div>
+                                <div class="card-body">
+                                    <div id="recent-contacts-list"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Recent Conversations</h5>
+                                </div>
+                                <div class="card-body">
+                                    <div id="recent-conversations"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                document.getElementById('page-content').innerHTML = html;
+                
+                // Render recent contacts
+                const contactsList = document.getElementById('recent-contacts-list');
+                if (recentContacts.contacts && recentContacts.contacts.length > 0) {
+                    contactsList.innerHTML = recentContacts.contacts.map(c => `
+                        <div class="contact-card p-2 mb-2 border rounded" onclick="viewContact('${c.phone}')">
+                            <strong>${c.name || c.phone}</strong>
+                            <div>${(c.tags || []).map(t => `<span class="tag">${t}</span>`).join('')}</div>
+                            <small class="text-muted">Last: ${new Date(c.last_updated).toLocaleString()}</small>
+                        </div>
+                    `).join('');
+                } else {
+                    contactsList.innerHTML = '<p class="text-muted">No contacts yet</p>';
+                }
+                
+                // Render recent conversations
+                const convList = document.getElementById('recent-conversations');
+                if (recentConv.conversations && recentConv.conversations.length > 0) {
+                    convList.innerHTML = recentConv.conversations.map(c => `
+                        <div class="message-bubble ${c.direction === 'incoming' ? 'incoming' : 'outgoing'}">
+                            <strong>${c.phone}</strong><br>
+                            ${c.message}<br>
+                            <small class="text-muted">${new Date(c.timestamp).toLocaleString()}</small>
+                        </div>
+                    `).join('');
+                } else {
+                    convList.innerHTML = '<p class="text-muted">No conversations yet</p>';
+                }
+                
+            } catch (err) {
+                console.error(err);
+                document.getElementById('page-content').innerHTML = '<div class="alert alert-danger">Error loading dashboard</div>';
+            }
+            showLoading(false);
+        }
+        
+        async function loadContacts() {
+            showLoading(true);
+            try {
+                const data = await apiCall('contacts?limit=200');
+                const tags = await apiCall('tags');
+                
+                const html = `
+                    <h2><i class="bi bi-people"></i> Contacts Management</h2>
+                    <hr>
+                    
+                    <div class="mb-3">
+                        <button class="btn btn-primary" onclick="showAddContactModal()">
+                            <i class="bi bi-plus"></i> Add Contact
+                        </button>
+                        <button class="btn btn-success" onclick="importContacts()">
+                            <i class="bi bi-upload"></i> Import
+                        </button>
+                        <button class="btn btn-info" onclick="exportContacts()">
+                            <i class="bi bi-download"></i> Export
+                        </button>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-4">
+                            <input type="text" id="search-contacts" class="form-control" placeholder="Search contacts...">
+                        </div>
+                        <div class="col-md-4">
+                            <select id="tag-filter" class="form-control">
+                                <option value="">All Tags</option>
+                                ${(tags || []).map(t => `<option value="${t._id}">${t._id} (${t.count})</option>`).join('')}
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="table-responsive">
+                        <table class="table table-hover">
+                            <thead>
+                                <tr>
+                                    <th>Phone</th>
+                                    <th>Name</th>
+                                    <th>Tags</th>
+                                    <th>Last Message</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="contacts-table">
+                                ${data.contacts.map(c => `
+                                    <tr>
+                                        <td>${c.phone}</td>
+                                        <td>${c.name || '-'}</td>
+                                        <td>${(c.tags || []).map(t => `<span class="tag">${t}</span>`).join('')}</td>
+                                        <td>${c.last_message_at ? new Date(c.last_message_at).toLocaleString() : '-'}</td>
+                                        <td>
+                                            <button class="btn btn-sm btn-info" onclick="viewContact('${c.phone}')">
+                                                <i class="bi bi-eye"></i>
+                                            </button>
+                                            <button class="btn btn-sm btn-primary" onclick="sendMessageTo('${c.phone}')">
+                                                <i class="bi bi-chat"></i>
+                                            </button>
+                                            <button class="btn btn-sm btn-warning" onclick="addTagTo('${c.phone}')">
+                                                <i class="bi bi-tag"></i>
+                                            </button>
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+                
+                document.getElementById('page-content').innerHTML = html;
+                
+                // Add search functionality
+                document.getElementById('search-contacts').addEventListener('input', filterContacts);
+                document.getElementById('tag-filter').addEventListener('change', filterContacts);
+                
+            } catch (err) {
+                console.error(err);
+                document.getElementById('page-content').innerHTML = '<div class="alert alert-danger">Error loading contacts</div>';
+            }
+            showLoading(false);
+        }
+        
+        async function loadCampaigns() {
+            showLoading(true);
+            try {
+                const campaigns = await apiCall('campaigns');
+                const templates = await apiCall('templates');
+                const tags = await apiCall('tags');
+                
+                const html = `
+                    <h2><i class="bi bi-megaphone"></i> Broadcast Campaigns</h2>
+                    <hr>
+                    
+                    <div class="mb-3">
+                        <button class="btn btn-primary" onclick="showCreateCampaignModal()">
+                            <i class="bi bi-plus"></i> Create Campaign
+                        </button>
+                    </div>
+                    
+                    <div class="row">
+                        ${campaigns.map(c => `
+                            <div class="col-md-6 mb-3">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <strong>${c.name}</strong>
+                                        <span class="badge bg-${c.status === 'completed' ? 'success' : 'warning'} float-end">${c.status}</span>
+                                    </div>
+                                    <div class="card-body">
+                                        <p>${c.message.substring(0, 100)}...</p>
+                                        <small>Target: ${(c.target_tags || []).join(', ') || 'All contacts'}</small><br>
+                                        <small>Created: ${new Date(c.created_at).toLocaleString()}</small>
+                                        ${c.status === 'draft' ? `
+                                            <button class="btn btn-sm btn-success mt-2" onclick="executeCampaign('${c._id}')">
+                                                <i class="bi bi-play"></i> Execute
+                                            </button>
+                                        ` : `
+                                            <div class="mt-2">
+                                                <small>Sent: ${c.sent_count || 0} | Failed: ${c.failed_count || 0}</small>
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+                
+                document.getElementById('page-content').innerHTML = html;
+            } catch (err) {
+                console.error(err);
+            }
+            showLoading(false);
+        }
+        
+        async function loadTemplates() {
+            showLoading(true);
+            try {
+                const templates = await apiCall('templates');
+                
+                const html = `
+                    <h2><i class="bi bi-file-text"></i> Message Templates</h2>
+                    <hr>
+                    
+                    <div class="mb-3">
+                        <button class="btn btn-primary" onclick="showCreateTemplateModal()">
+                            <i class="bi bi-plus"></i> Create Template
+                        </button>
+                    </div>
+                    
+                    <div class="row">
+                        ${templates.map(t => `
+                            <div class="col-md-6 mb-3">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <strong>${t.name}</strong>
+                                        <span class="badge bg-secondary float-end">${t.category || 'General'}</span>
+                                    </div>
+                                    <div class="card-body">
+                                        <p>${t.content}</p>
+                                        <button class="btn btn-sm btn-primary" onclick="useTemplate('${t.name}')">
+                                            <i class="bi bi-chat"></i> Use Template
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+                
+                document.getElementById('page-content').innerHTML = html;
+            } catch (err) {
+                console.error(err);
+            }
+            showLoading(false);
+        }
+        
+        async function loadAnalytics() {
+            showLoading(true);
+            try {
+                const analytics = await apiCall('analytics');
+                
+                const html = `
+                    <h2><i class="bi bi-graph-up"></i> Analytics</h2>
+                    <hr>
+                    
+                    <div class="row mb-4">
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Messages by Day</h5>
+                                </div>
+                                <div class="card-body">
+                                    <canvas id="messagesChart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Top Tags</h5>
+                                </div>
+                                <div class="card-body">
+                                    <canvas id="tagsChart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-12">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Engagement Metrics</h5>
+                                </div>
+                                <div class="card-body">
+                                    <table class="table">
+                                        <tr>
+                                            <th>Total Contacts</th>
+                                            <td>${analytics.total_contacts || 0}</td>
+                                        </tr>
+                                        <tr>
+                                            <th>Total Messages</th>
+                                            <td>${analytics.total_messages || 0}</td>
+                                        </tr>
+                                        <tr>
+                                            <th>Active Today</th>
+                                            <td>${analytics.active_today || 0}</td>
+                                        </tr>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                document.getElementById('page-content').innerHTML = html;
+                
+                // Create charts
+                if (analytics.messages_by_day) {
+                    const ctx = document.getElementById('messagesChart').getContext('2d');
+                    new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: analytics.messages_by_day.map(d => d._id),
+                            datasets: [{
+                                label: 'Messages',
+                                data: analytics.messages_by_day.map(d => d.count),
+                                borderColor: '#667eea',
+                                tension: 0.1
+                            }]
+                        }
+                    });
+                }
+                
+                if (analytics.top_tags) {
+                    const ctx2 = document.getElementById('tagsChart').getContext('2d');
+                    new Chart(ctx2, {
+                        type: 'pie',
+                        data: {
+                            labels: analytics.top_tags.map(t => t._id),
+                            datasets: [{
+                                data: analytics.top_tags.map(t => t.count),
+                                backgroundColor: ['#667eea', '#764ba2', '#f093fb', '#4facfe', '#00f2fe']
+                            }]
+                        }
+                    });
+                }
+                
+            } catch (err) {
+                console.error(err);
+            }
+            showLoading(false);
+        }
+        
+        // Helper functions
+        function showLoading(show) {
+            document.getElementById('loading').style.display = show ? 'block' : 'none';
+        }
+        
+        function filterContacts() {
+            const search = document.getElementById('search-contacts')?.value.toLowerCase() || '';
+            const tagFilter = document.getElementById('tag-filter')?.value || '';
+            const rows = document.querySelectorAll('#contacts-table tr');
+            
+            rows.forEach(row => {
+                const text = row.innerText.toLowerCase();
+                const tags = row.cells[2]?.innerText || '';
+                let show = true;
+                
+                if (search && !text.includes(search)) show = false;
+                if (tagFilter && !tags.includes(tagFilter)) show = false;
+                
+                row.style.display = show ? '' : 'none';
+            });
+        }
+        
+        window.viewContact = async function(phone) {
+            const contact = await apiCall(`contacts/${phone}`);
+            const conversations = await apiCall(`conversations/${phone}`);
+            const notes = await apiCall(`notes/${phone}`);
+            
+            const modalHtml = `
+                <div class="modal fade" id="contactModal" tabindex="-1">
+                    <div class="modal-dialog modal-lg">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h5 class="modal-title">Contact: ${contact.name || phone}</h5>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                            </div>
+                            <div class="modal-body">
+                                <ul class="nav nav-tabs" role="tablist">
+                                    <li class="nav-item">
+                                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#info">Info</button>
+                                    </li>
+                                    <li class="nav-item">
+                                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#conversations">Conversations</button>
+                                    </li>
+                                    <li class="nav-item">
+                                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#notes">Notes</button>
+                                    </li>
+                                </ul>
+                                
+                                <div class="tab-content mt-3">
+                                    <div class="tab-pane active" id="info">
+                                        <p><strong>Phone:</strong> ${contact.phone}</p>
+                                        <p><strong>Name:</strong> ${contact.name || '-'}</p>
+                                        <p><strong>Email:</strong> ${contact.email || '-'}</p>
+                                        <p><strong>Tags:</strong> ${(contact.tags || []).map(t => `<span class="tag">${t}</span>`).join('')}</p>
+                                        <p><strong>Status:</strong> ${contact.status || 'active'}</p>
+                                        <p><strong>Total Messages:</strong> ${contact.total_messages || 0}</p>
+                                        <p><strong>Last Message:</strong> ${contact.last_message_at ? new Date(contact.last_message_at).toLocaleString() : '-'}</p>
+                                    </div>
+                                    <div class="tab-pane" id="conversations">
+                                        ${conversations.map(c => `
+                                            <div class="message-bubble ${c.direction === 'incoming' ? 'incoming' : 'outgoing'}">
+                                                <strong>${c.direction === 'incoming' ? 'Received' : 'Sent'}</strong><br>
+                                                ${c.message}<br>
+                                                <small class="text-muted">${new Date(c.timestamp).toLocaleString()}</small>
+                                            </div>
+                                        `).join('') || '<p>No conversations yet</p>'}
+                                    </div>
+                                    <div class="tab-pane" id="notes">
+                                        <textarea id="new-note" class="form-control mb-2" rows="3" placeholder="Add a note..."></textarea>
+                                        <button class="btn btn-primary btn-sm" onclick="addNote('${phone}')">Add Note</button>
+                                        <hr>
+                                        ${notes.map(n => `
+                                            <div class="border-bottom mb-2 pb-2">
+                                                <small class="text-muted">${new Date(n.created_at).toLocaleString()}</small>
+                                                <p>${n.note}</p>
+                                            </div>
+                                        `).join('') || '<p>No notes yet</p>'}
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button class="btn btn-primary" onclick="sendMessageTo('${phone}')">Send Message</button>
+                                <button class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // Remove existing modal and add new one
+            const existingModal = document.getElementById('contactModal');
+            if (existingModal) existingModal.remove();
+            
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+            const modal = new bootstrap.Modal(document.getElementById('contactModal'));
+            modal.show();
+        };
+        
+        window.sendMessageTo = function(phone) {
+            const message = prompt('Enter message to send:');
+            if (message) {
+                fetch('/api/crm/bulk/send', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-secret': API_KEY
+                    },
+                    body: JSON.stringify({
+                        contacts: [{ phone }],
+                        message: message
+                    })
+                }).then(() => {
+                    alert('Message sent!');
+                }).catch(err => {
+                    alert('Error sending message');
+                });
+            }
+        };
+        
+        window.addNote = async function(phone) {
+            const note = document.getElementById('new-note')?.value;
+            if (note) {
+                await apiCall('notes', {
+                    method: 'POST',
+                    body: JSON.stringify({ phone, note })
+                });
+                document.getElementById('new-note').value = '';
+                alert('Note added!');
+                viewContact(phone); // Refresh
+            }
+        };
+        
+        window.addTagTo = async function(phone) {
+            const tag = prompt('Enter tag name:');
+            if (tag) {
+                await apiCall(`contacts/${phone}/tags`, {
+                    method: 'POST',
+                    body: JSON.stringify({ tag })
+                });
+                alert('Tag added!');
+                loadContacts(); // Refresh
+            }
+        };
+        
+        window.showCreateCampaignModal = function() {
+            const tags = prompt('Enter target tags (comma-separated) or leave empty for all:');
+            const message = prompt('Enter campaign message:');
+            const name = prompt('Enter campaign name:');
+            
+            if (message && name) {
+                apiCall('campaigns', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        name,
+                        message,
+                        target_tags: tags ? tags.split(',') : []
+                    })
+                }).then(() => {
+                    alert('Campaign created!');
+                    loadCampaigns();
+                });
+            }
+        };
+        
+        window.executeCampaign = async function(campaignId) {
+            if (confirm('Execute this campaign? This will send messages to all targeted contacts.')) {
+                const result = await apiCall(`campaigns/${campaignId}/execute`, { method: 'POST' });
+                alert(`Campaign executed! Sent: ${result.sent}, Failed: ${result.failed}`);
+                loadCampaigns();
+            }
+        };
+        
+        window.showCreateTemplateModal = function() {
+            const name = prompt('Template name:');
+            const content = prompt('Template content:');
+            const category = prompt('Category (optional):');
+            
+            if (name && content) {
+                apiCall('templates', {
+                    method: 'POST',
+                    body: JSON.stringify({ name, content, category })
+                }).then(() => {
+                    alert('Template created!');
+                    loadTemplates();
+                });
+            }
+        };
+        
+        window.useTemplate = function(templateName) {
+            const phone = prompt('Enter phone number:');
+            if (phone) {
+                apiCall('templates').then(templates => {
+                    const template = templates.find(t => t.name === templateName);
+                    if (template) {
+                        sendMessageTo(phone, template.content);
+                    }
+                });
+            }
+        };
+        
+        window.importContacts = function() {
+            const contactsData = prompt('Paste contacts JSON (array of objects with phone, name, tags):');
+            if (contactsData) {
+                try {
+                    const contacts = JSON.parse(contactsData);
+                    apiCall('import', {
+                        method: 'POST',
+                        body: JSON.stringify({ contacts })
+                    }).then(result => {
+                        alert(`Imported ${result.imported} contacts!`);
+                        loadContacts();
+                    });
+                } catch (err) {
+                    alert('Invalid JSON format');
+                }
+            }
+        };
+        
+        window.exportContacts = function() {
+            window.open(`/api/crm/export?format=csv&api_secret=${API_KEY}`);
+        };
+        
+        // Page routing
+        document.querySelectorAll('.sidebar a').forEach(link => {
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                const page = link.dataset.page;
+                currentPage = page;
+                
+                // Update active state
+                document.querySelectorAll('.sidebar a').forEach(l => l.classList.remove('active'));
+                link.classList.add('active');
+                
+                // Load page
+                switch(page) {
+                    case 'dashboard': loadDashboard(); break;
+                    case 'contacts': loadContacts(); break;
+                    case 'campaigns': loadCampaigns(); break;
+                    case 'templates': loadTemplates(); break;
+                    case 'analytics': loadAnalytics(); break;
+                    default: loadDashboard();
+                }
+            });
+        });
+        
+        // Initial load
+        loadDashboard();
+    </script>
+</body>
+</html>
