@@ -1,4 +1,4 @@
-// server.js — Baileys WhatsApp microservice with MongoDB persistence (ESM)
+// server.js — Baileys WhatsApp microservice with MongoDB persistence and CRM (ESM)
 import makeWASocket, {
     DisconnectReason,
     useMultiFileAuthState,
@@ -19,8 +19,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ─── Config ────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || 'changeme-set-this-in-railway-dashboard';
-
-// Your MongoDB connection string
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://bobadillajairo_db_user:fHsz934E3tTPCcpF@cluster0.8nnfj9g.mongodb.net/?appName=Cluster0';
 const DB_NAME = process.env.DB_NAME || 'whatsapp_bot';
 
@@ -50,10 +48,17 @@ async function connectMongoDB() {
             scheduledMessages: db.collection('scheduled_messages'),
             messageHistory: db.collection('message_history'),
             groupsCache: db.collection('groups_cache'),
-            botSettings: db.collection('bot_settings')
+            botSettings: db.collection('bot_settings'),
+            // CRM Collections
+            contacts: db.collection('crm_contacts'),
+            conversations: db.collection('crm_conversations'),
+            tags: db.collection('crm_tags'),
+            notes: db.collection('crm_notes'),
+            campaigns: db.collection('crm_campaigns'),
+            templates: db.collection('crm_templates')
         };
         
-        // Create indexes for better performance
+        // Create indexes
         await collections.scheduledMessages.createIndex({ schedule_time: 1 });
         await collections.scheduledMessages.createIndex({ jid: 1 });
         await collections.scheduledMessages.createIndex({ executed: 1 });
@@ -62,13 +67,20 @@ async function connectMongoDB() {
         await collections.messageHistory.createIndex({ message_id: 1 }, { unique: true });
         await collections.authState.createIndex({ id: 1 }, { unique: true });
         
+        // CRM Indexes
+        await collections.contacts.createIndex({ phone: 1 }, { unique: true });
+        await collections.contacts.createIndex({ tags: 1 });
+        await collections.conversations.createIndex({ contact_id: 1 });
+        await collections.conversations.createIndex({ timestamp: -1 });
+        await collections.campaigns.createIndex({ created_at: -1 });
+        await collections.templates.createIndex({ name: 1 }, { unique: true });
+        
         console.log('[MongoDB] ✅ Connected to MongoDB Atlas successfully');
         console.log(`[MongoDB] Database: ${DB_NAME}`);
         
         return true;
     } catch (err) {
         console.error('[MongoDB] ❌ Connection error:', err.message);
-        console.error('[MongoDB] Please check your connection string and network access');
         return false;
     }
 }
@@ -80,15 +92,9 @@ class MongoDBDataStore {
         try {
             await collections.authState.updateOne(
                 { id: id },
-                { 
-                    $set: { 
-                        state: state,
-                        updated_at: new Date()
-                    }
-                },
+                { $set: { state: state, updated_at: new Date() } },
                 { upsert: true }
             );
-            console.log('[MongoDB] Auth state saved');
             return true;
         } catch (err) {
             console.error('[MongoDB] Error saving auth state:', err);
@@ -99,11 +105,7 @@ class MongoDBDataStore {
     static async loadAuthState(id) {
         try {
             const doc = await collections.authState.findOne({ id: id });
-            if (doc) {
-                console.log('[MongoDB] Auth state loaded');
-                return doc.state;
-            }
-            return null;
+            return doc?.state || null;
         } catch (err) {
             console.error('[MongoDB] Error loading auth state:', err);
             return null;
@@ -136,11 +138,10 @@ class MongoDBDataStore {
 
     static async getPendingScheduledMessages() {
         try {
-            const messages = await collections.scheduledMessages.find({
+            return await collections.scheduledMessages.find({
                 executed: false,
                 schedule_time: { $lte: new Date() }
             }).sort({ schedule_time: 1 }).toArray();
-            return messages;
         } catch (err) {
             console.error('[MongoDB] Error getting pending messages:', err);
             return [];
@@ -150,13 +151,10 @@ class MongoDBDataStore {
     static async getScheduledMessagesByJid(jid, includeExecuted = false) {
         try {
             const query = { jid: jid };
-            if (!includeExecuted) {
-                query.executed = false;
-            }
-            const messages = await collections.scheduledMessages.find(query)
+            if (!includeExecuted) query.executed = false;
+            return await collections.scheduledMessages.find(query)
                 .sort({ schedule_time: 1 })
                 .toArray();
-            return messages;
         } catch (err) {
             console.error('[MongoDB] Error getting messages by JID:', err);
             return [];
@@ -167,12 +165,7 @@ class MongoDBDataStore {
         try {
             await collections.scheduledMessages.updateOne(
                 { id: id },
-                { 
-                    $set: { 
-                        executed: true, 
-                        executed_at: new Date() 
-                    }
-                }
+                { $set: { executed: true, executed_at: new Date() } }
             );
             return true;
         } catch (err) {
@@ -185,10 +178,7 @@ class MongoDBDataStore {
         try {
             await collections.scheduledMessages.updateOne(
                 { id: id },
-                { 
-                    $inc: { retry_count: 1 },
-                    $set: { last_error: error }
-                }
+                { $inc: { retry_count: 1 }, $set: { last_error: error } }
             );
         } catch (err) {
             console.error('[MongoDB] Error updating retry:', err);
@@ -211,7 +201,6 @@ class MongoDBDataStore {
         try {
             const cutoff = new Date();
             cutoff.setDate(cutoff.getDate() - daysToKeep);
-            
             const result = await collections.scheduledMessages.deleteMany({
                 executed: true,
                 executed_at: { $lt: cutoff }
@@ -252,11 +241,10 @@ class MongoDBDataStore {
 
     static async getRecentMessages(jid, limit = 50) {
         try {
-            const messages = await collections.messageHistory.find({ jid: jid })
+            return await collections.messageHistory.find({ jid: jid })
                 .sort({ timestamp: -1 })
                 .limit(limit)
                 .toArray();
-            return messages;
         } catch (err) {
             console.error('[MongoDB] Error getting recent messages:', err);
             return [];
@@ -265,14 +253,13 @@ class MongoDBDataStore {
 
     static async searchMessages(jid, searchTerm, limit = 20) {
         try {
-            const messages = await collections.messageHistory.find({
+            return await collections.messageHistory.find({
                 jid: jid,
                 message_text: { $regex: searchTerm, $options: 'i' }
             })
                 .sort({ timestamp: -1 })
                 .limit(limit)
                 .toArray();
-            return messages;
         } catch (err) {
             console.error('[MongoDB] Error searching messages:', err);
             return [];
@@ -318,62 +305,389 @@ class MongoDBDataStore {
         }
     }
 
-    // Groups Methods
-    static async saveGroup(jid, name, participants) {
+    // ========== CRM METHODS ==========
+    
+    // Contacts Management
+    static async createOrUpdateContact(contactData) {
         try {
-            await collections.groupsCache.updateOne(
-                { jid: jid },
-                {
-                    $set: {
-                        name: name,
-                        participants: participants,
-                        updated_at: new Date()
+            const result = await collections.contacts.updateOne(
+                { phone: contactData.phone },
+                { 
+                    $set: { 
+                        ...contactData,
+                        last_updated: new Date()
+                    },
+                    $setOnInsert: {
+                        created_at: new Date(),
+                        total_messages: 0,
+                        total_conversations: 0
                     }
                 },
                 { upsert: true }
             );
+            return result;
         } catch (err) {
-            console.error('[MongoDB] Error saving group:', err);
-        }
-    }
-
-    static async getGroups() {
-        try {
-            const groups = await collections.groupsCache.find({})
-                .sort({ name: 1 })
-                .toArray();
-            return groups;
-        } catch (err) {
-            console.error('[MongoDB] Error getting groups:', err);
-            return [];
-        }
-    }
-
-    // Settings Methods
-    static async getSetting(key) {
-        try {
-            const doc = await collections.botSettings.findOne({ key: key });
-            return doc?.value || null;
-        } catch (err) {
-            console.error('[MongoDB] Error getting setting:', err);
+            console.error('[CRM] Error saving contact:', err);
             return null;
         }
     }
 
-    static async saveSetting(key, value) {
+    static async getContact(phone) {
         try {
-            await collections.botSettings.updateOne(
-                { key: key },
-                {
-                    $set: {
-                        value: value,
-                        updated_at: new Date()
+            return await collections.contacts.findOne({ phone: phone });
+        } catch (err) {
+            console.error('[CRM] Error getting contact:', err);
+            return null;
+        }
+    }
+
+    static async getAllContacts(filters = {}, limit = 100, skip = 0) {
+        try {
+            const query = {};
+            if (filters.tags) query.tags = { $in: filters.tags };
+            if (filters.status) query.status = filters.status;
+            if (filters.search) {
+                query.$or = [
+                    { phone: { $regex: filters.search, $options: 'i' } },
+                    { name: { $regex: filters.search, $options: 'i' } },
+                    { email: { $regex: filters.search, $options: 'i' } }
+                ];
+            }
+            
+            const contacts = await collections.contacts.find(query)
+                .sort({ last_updated: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray();
+            
+            const total = await collections.contacts.countDocuments(query);
+            return { contacts, total };
+        } catch (err) {
+            console.error('[CRM] Error getting contacts:', err);
+            return { contacts: [], total: 0 };
+        }
+    }
+
+    static async addContactTag(phone, tag) {
+        try {
+            await collections.contacts.updateOne(
+                { phone: phone },
+                { $addToSet: { tags: tag } }
+            );
+            return true;
+        } catch (err) {
+            console.error('[CRM] Error adding tag:', err);
+            return false;
+        }
+    }
+
+    static async removeContactTag(phone, tag) {
+        try {
+            await collections.contacts.updateOne(
+                { phone: phone },
+                { $pull: { tags: tag } }
+            );
+            return true;
+        } catch (err) {
+            console.error('[CRM] Error removing tag:', err);
+            return false;
+        }
+    }
+
+    static async deleteContact(phone) {
+        try {
+            const result = await collections.contacts.deleteOne({ phone: phone });
+            return result.deletedCount > 0;
+        } catch (err) {
+            console.error('[CRM] Error deleting contact:', err);
+            return false;
+        }
+    }
+
+    // Conversations Management
+    static async saveConversation(conversationData) {
+        try {
+            const result = await collections.conversations.insertOne({
+                ...conversationData,
+                timestamp: new Date()
+            });
+            
+            // Update contact's message count
+            await collections.contacts.updateOne(
+                { phone: conversationData.phone },
+                { 
+                    $inc: { total_messages: 1 },
+                    $set: { last_message_at: new Date() }
+                }
+            );
+            
+            return result;
+        } catch (err) {
+            console.error('[CRM] Error saving conversation:', err);
+            return null;
+        }
+    }
+
+    static async getConversations(phone, limit = 50) {
+        try {
+            return await collections.conversations.find({ phone: phone })
+                .sort({ timestamp: -1 })
+                .limit(limit)
+                .toArray();
+        } catch (err) {
+            console.error('[CRM] Error getting conversations:', err);
+            return [];
+        }
+    }
+
+    static async getAllConversations(limit = 100, skip = 0) {
+        try {
+            const conversations = await collections.conversations.find()
+                .sort({ timestamp: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray();
+            
+            const total = await collections.conversations.countDocuments();
+            return { conversations, total };
+        } catch (err) {
+            console.error('[CRM] Error getting conversations:', err);
+            return { conversations: [], total: 0 };
+        }
+    }
+
+    // Notes Management
+    static async addNote(phone, note, createdBy = 'system') {
+        try {
+            const noteData = {
+                phone: phone,
+                note: note,
+                created_by: createdBy,
+                created_at: new Date()
+            };
+            
+            await collections.notes.insertOne(noteData);
+            
+            // Update contact with latest note
+            await collections.contacts.updateOne(
+                { phone: phone },
+                { 
+                    $push: { notes: noteData },
+                    $set: { last_note_at: new Date() }
+                }
+            );
+            
+            return true;
+        } catch (err) {
+            console.error('[CRM] Error adding note:', err);
+            return false;
+        }
+    }
+
+    static async getNotes(phone, limit = 20) {
+        try {
+            return await collections.notes.find({ phone: phone })
+                .sort({ created_at: -1 })
+                .limit(limit)
+                .toArray();
+        } catch (err) {
+            console.error('[CRM] Error getting notes:', err);
+            return [];
+        }
+    }
+
+    // Tags Management
+    static async getAllTags() {
+        try {
+            const tags = await collections.contacts.aggregate([
+                { $unwind: "$tags" },
+                { $group: { _id: "$tags", count: { $sum: 1 } } },
+                { $sort: { count: -1 } }
+            ]).toArray();
+            return tags;
+        } catch (err) {
+            console.error('[CRM] Error getting tags:', err);
+            return [];
+        }
+    }
+
+    // Campaigns Management
+    static async createCampaign(campaignData) {
+        try {
+            const campaign = {
+                ...campaignData,
+                created_at: new Date(),
+                status: 'draft',
+                sent_count: 0,
+                failed_count: 0
+            };
+            const result = await collections.campaigns.insertOne(campaign);
+            return result;
+        } catch (err) {
+            console.error('[CRM] Error creating campaign:', err);
+            return null;
+        }
+    }
+
+    static async getCampaigns() {
+        try {
+            return await collections.campaigns.find()
+                .sort({ created_at: -1 })
+                .toArray();
+        } catch (err) {
+            console.error('[CRM] Error getting campaigns:', err);
+            return [];
+        }
+    }
+
+    static async getCampaign(id) {
+        try {
+            const { ObjectId } = await import('mongodb');
+            return await collections.campaigns.findOne({ _id: new ObjectId(id) });
+        } catch (err) {
+            console.error('[CRM] Error getting campaign:', err);
+            return null;
+        }
+    }
+
+    static async executeCampaign(campaignId) {
+        try {
+            const { ObjectId } = await import('mongodb');
+            const campaign = await collections.campaigns.findOne({ _id: new ObjectId(campaignId) });
+            if (!campaign) return null;
+            
+            // Get target contacts based on filters
+            let query = {};
+            if (campaign.target_tags && campaign.target_tags.length > 0) {
+                query.tags = { $in: campaign.target_tags };
+            }
+            
+            const contacts = await collections.contacts.find(query).toArray();
+            let sent = 0, failed = 0;
+            
+            for (const contact of contacts) {
+                try {
+                    const jid = contact.phone + '@s.whatsapp.net';
+                    if (sock && sessionStatus === 'connected') {
+                        await sock.sendMessage(jid, { text: campaign.message });
+                        sent++;
+                        
+                        // Save to conversation history
+                        await MongoDBDataStore.saveConversation({
+                            phone: contact.phone,
+                            message: campaign.message,
+                            direction: 'outgoing',
+                            campaign_id: campaignId,
+                            status: 'sent'
+                        });
+                        
+                        await new Promise(resolve => setTimeout(resolve, 1000));
                     }
-                },
+                } catch (err) {
+                    failed++;
+                    console.error(`[CRM] Failed to send to ${contact.phone}:`, err);
+                }
+            }
+            
+            // Update campaign stats
+            await collections.campaigns.updateOne(
+                { _id: new ObjectId(campaignId) },
+                { 
+                    $set: { 
+                        status: 'completed',
+                        executed_at: new Date(),
+                        sent_count: sent,
+                        failed_count: failed
+                    }
+                }
+            );
+            
+            return { sent, failed, total: contacts.length };
+        } catch (err) {
+            console.error('[CRM] Error executing campaign:', err);
+            return null;
+        }
+    }
+
+    static async deleteCampaign(campaignId) {
+        try {
+            const { ObjectId } = await import('mongodb');
+            const result = await collections.campaigns.deleteOne({ _id: new ObjectId(campaignId) });
+            return result.deletedCount > 0;
+        } catch (err) {
+            console.error('[CRM] Error deleting campaign:', err);
+            return false;
+        }
+    }
+
+    // Templates Management
+    static async saveTemplate(templateData) {
+        try {
+            const result = await collections.templates.updateOne(
+                { name: templateData.name },
+                { $set: { ...templateData, updated_at: new Date() } },
                 { upsert: true }
             );
+            return result;
         } catch (err) {
-            console.error('[MongoDB] Error saving setting:', err);
+            console.error('[CRM] Error saving template:', err);
+            return null;
+        }
+    }
+
+    static async getTemplates() {
+        try {
+            return await collections.templates.find()
+                .sort({ name: 1 })
+                .toArray();
+        } catch (err) {
+            console.error('[CRM] Error getting templates:', err);
+            return [];
+        }
+    }
+
+    static async deleteTemplate(name) {
+        try {
+            const result = await collections.templates.deleteOne({ name: name });
+            return result.deletedCount > 0;
+        } catch (err) {
+            console.error('[CRM] Error deleting template:', err);
+            return false;
+        }
+    }
+
+    // Analytics
+    static async getAnalytics() {
+        try {
+            const totalContacts = await collections.contacts.countDocuments();
+            const totalMessages = await collections.conversations.countDocuments();
+            const activeToday = await collections.conversations.countDocuments({
+                timestamp: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) }
+            });
+            
+            const messagesByDay = await collections.conversations.aggregate([
+                {
+                    $group: {
+                        _id: { $dateToString: { format: "%Y-%m-%d", date: "$timestamp" } },
+                        count: { $sum: 1 }
+                    }
+                },
+                { $sort: { _id: -1 } },
+                { $limit: 7 }
+            ]).toArray();
+            
+            const topTags = await this.getAllTags();
+            
+            return {
+                total_contacts: totalContacts,
+                total_messages: totalMessages,
+                active_today: activeToday,
+                messages_by_day: messagesByDay.reverse(),
+                top_tags: topTags.slice(0, 5)
+            };
+        } catch (err) {
+            console.error('[CRM] Error getting analytics:', err);
+            return null;
         }
     }
 }
@@ -442,7 +756,6 @@ async function checkScheduledMessages() {
             }
         }
         
-        // Clean up old messages weekly
         await MongoDBDataStore.cleanupOldMessages(7);
         
     } catch (err) {
@@ -649,6 +962,7 @@ async function handleCommand(jid, command, originalMsg, msgInfo) {
 // ─── Express Server ───────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
+app.use(express.static('public'));
 
 function authCheck(req, res, next) {
     if (req.headers['x-api-secret'] !== API_SECRET) {
@@ -657,7 +971,7 @@ function authCheck(req, res, next) {
     next();
 }
 
-// ─── Routes ────────────────────────────────────────────────────────────────
+// ─── Basic Routes ─────────────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
     let dbStatus = 'disconnected';
     try {
@@ -707,6 +1021,15 @@ app.post('/send', authCheck, async (req, res) => {
     try {
         const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net';
         await sock.sendMessage(jid, { text: message });
+        
+        // Save to CRM conversation
+        await MongoDBDataStore.saveConversation({
+            phone: phone,
+            message: message,
+            direction: 'outgoing',
+            status: 'sent'
+        });
+        
         res.json({ success: true, to: jid, timestamp: new Date().toISOString() });
     } catch (err) {
         console.error('Send error:', err.message);
@@ -804,11 +1127,6 @@ app.get('/groups', authCheck, async (req, res) => {
             owner: g.owner
         }));
         
-        // Save to cache
-        for (const group of groupList) {
-            await MongoDBDataStore.saveGroup(group.id, group.name, group.participants);
-        }
-        
         res.json(groupList);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -856,7 +1174,6 @@ app.post('/logout', authCheck, async (req, res) => {
         if (sock) await sock.logout(); 
     } catch (_) {}
     
-    // Clear auth from MongoDB
     await MongoDBDataStore.saveAuthState('whatsapp-auth', {});
     
     sessionStatus = 'disconnected';
@@ -884,14 +1201,260 @@ app.get('/ping-stats', authCheck, (req, res) => {
             connected: mongoClient && mongoClient.topology?.isConnected(),
             type: 'MongoDB Atlas',
             name: DB_NAME
-        },
-        scheduled: {
-            pending: scheduledMessages?.filter(m => !m.executed).length || 0
         }
     });
 });
 
-// ─── Baileys Connection with MongoDB Auth ─────────────────────────────────
+// ─── CRM API Routes ───────────────────────────────────────────────────────
+
+// Serve CRM dashboard
+app.get('/crm', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'crm.html'));
+});
+
+// Contacts CRUD
+app.get('/api/crm/contacts', authCheck, async (req, res) => {
+    const { limit = 100, skip = 0, tags, status, search } = req.query;
+    const filters = {};
+    if (tags) filters.tags = tags.split(',');
+    if (status) filters.status = status;
+    if (search) filters.search = search;
+    
+    const result = await MongoDBDataStore.getAllContacts(filters, parseInt(limit), parseInt(skip));
+    res.json(result);
+});
+
+app.get('/api/crm/contacts/:phone', authCheck, async (req, res) => {
+    const contact = await MongoDBDataStore.getContact(req.params.phone);
+    if (!contact) {
+        return res.status(404).json({ error: 'Contact not found' });
+    }
+    res.json(contact);
+});
+
+app.post('/api/crm/contacts', authCheck, async (req, res) => {
+    const { phone, name, email, tags, status, notes } = req.body;
+    if (!phone) {
+        return res.status(400).json({ error: 'Phone is required' });
+    }
+    
+    const result = await MongoDBDataStore.createOrUpdateContact({
+        phone,
+        name,
+        email,
+        tags: tags || [],
+        status: status || 'active',
+        notes: notes || []
+    });
+    
+    res.json({ success: true, result });
+});
+
+app.delete('/api/crm/contacts/:phone', authCheck, async (req, res) => {
+    const deleted = await MongoDBDataStore.deleteContact(req.params.phone);
+    if (deleted) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Contact not found' });
+    }
+});
+
+app.post('/api/crm/contacts/:phone/tags', authCheck, async (req, res) => {
+    const { tag } = req.body;
+    if (!tag) {
+        return res.status(400).json({ error: 'Tag is required' });
+    }
+    
+    await MongoDBDataStore.addContactTag(req.params.phone, tag);
+    res.json({ success: true });
+});
+
+app.delete('/api/crm/contacts/:phone/tags/:tag', authCheck, async (req, res) => {
+    await MongoDBDataStore.removeContactTag(req.params.phone, req.params.tag);
+    res.json({ success: true });
+});
+
+// Conversations
+app.get('/api/crm/conversations', authCheck, async (req, res) => {
+    const { limit = 100, skip = 0 } = req.query;
+    const result = await MongoDBDataStore.getAllConversations(parseInt(limit), parseInt(skip));
+    res.json(result);
+});
+
+app.get('/api/crm/conversations/:phone', authCheck, async (req, res) => {
+    const { limit = 50 } = req.query;
+    const conversations = await MongoDBDataStore.getConversations(req.params.phone, parseInt(limit));
+    res.json(conversations);
+});
+
+// Notes
+app.post('/api/crm/notes', authCheck, async (req, res) => {
+    const { phone, note } = req.body;
+    if (!phone || !note) {
+        return res.status(400).json({ error: 'Phone and note are required' });
+    }
+    
+    await MongoDBDataStore.addNote(phone, note, req.headers['x-user-id'] || 'api');
+    res.json({ success: true });
+});
+
+app.get('/api/crm/notes/:phone', authCheck, async (req, res) => {
+    const notes = await MongoDBDataStore.getNotes(req.params.phone);
+    res.json(notes);
+});
+
+// Tags
+app.get('/api/crm/tags', authCheck, async (req, res) => {
+    const tags = await MongoDBDataStore.getAllTags();
+    res.json(tags);
+});
+
+// Campaigns
+app.get('/api/crm/campaigns', authCheck, async (req, res) => {
+    const campaigns = await MongoDBDataStore.getCampaigns();
+    res.json(campaigns);
+});
+
+app.post('/api/crm/campaigns', authCheck, async (req, res) => {
+    const { name, message, target_tags, schedule_time } = req.body;
+    if (!name || !message) {
+        return res.status(400).json({ error: 'Name and message are required' });
+    }
+    
+    const result = await MongoDBDataStore.createCampaign({
+        name,
+        message,
+        target_tags: target_tags || [],
+        schedule_time: schedule_time ? new Date(schedule_time) : null
+    });
+    
+    res.json({ success: true, id: result.insertedId });
+});
+
+app.post('/api/crm/campaigns/:id/execute', authCheck, async (req, res) => {
+    const { id } = req.params;
+    const result = await MongoDBDataStore.executeCampaign(id);
+    res.json(result);
+});
+
+app.delete('/api/crm/campaigns/:id', authCheck, async (req, res) => {
+    const deleted = await MongoDBDataStore.deleteCampaign(req.params.id);
+    if (deleted) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Campaign not found' });
+    }
+});
+
+// Templates
+app.get('/api/crm/templates', authCheck, async (req, res) => {
+    const templates = await MongoDBDataStore.getTemplates();
+    res.json(templates);
+});
+
+app.post('/api/crm/templates', authCheck, async (req, res) => {
+    const { name, content, category } = req.body;
+    if (!name || !content) {
+        return res.status(400).json({ error: 'Name and content are required' });
+    }
+    
+    await MongoDBDataStore.saveTemplate({ name, content, category });
+    res.json({ success: true });
+});
+
+app.delete('/api/crm/templates/:name', authCheck, async (req, res) => {
+    const deleted = await MongoDBDataStore.deleteTemplate(req.params.name);
+    if (deleted) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Template not found' });
+    }
+});
+
+// Analytics
+app.get('/api/crm/analytics', authCheck, async (req, res) => {
+    const analytics = await MongoDBDataStore.getAnalytics();
+    res.json(analytics);
+});
+
+// Bulk Operations
+app.post('/api/crm/bulk/send', authCheck, async (req, res) => {
+    const { contacts, message, template_name } = req.body;
+    if (!contacts || !contacts.length) {
+        return res.status(400).json({ error: 'Contacts are required' });
+    }
+    
+    let finalMessage = message;
+    if (template_name) {
+        const templates = await MongoDBDataStore.getTemplates();
+        const template = templates.find(t => t.name === template_name);
+        if (template) finalMessage = template.content;
+    }
+    
+    const results = [];
+    for (const contact of contacts) {
+        try {
+            const jid = contact.phone + '@s.whatsapp.net';
+            if (sock && sessionStatus === 'connected') {
+                await sock.sendMessage(jid, { text: finalMessage });
+                
+                await MongoDBDataStore.saveConversation({
+                    phone: contact.phone,
+                    message: finalMessage,
+                    direction: 'outgoing',
+                    status: 'sent'
+                });
+                
+                results.push({ phone: contact.phone, success: true });
+            } else {
+                results.push({ phone: contact.phone, success: false, error: 'WhatsApp not connected' });
+            }
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (err) {
+            results.push({ phone: contact.phone, success: false, error: err.message });
+        }
+    }
+    
+    res.json({ results, total: results.length, success_count: results.filter(r => r.success).length });
+});
+
+// Import/Export
+app.post('/api/crm/import', authCheck, async (req, res) => {
+    const { contacts } = req.body;
+    if (!contacts || !contacts.length) {
+        return res.status(400).json({ error: 'Contacts array is required' });
+    }
+    
+    let imported = 0;
+    for (const contact of contacts) {
+        await MongoDBDataStore.createOrUpdateContact(contact);
+        imported++;
+    }
+    
+    res.json({ imported, total: contacts.length });
+});
+
+app.get('/api/crm/export', authCheck, async (req, res) => {
+    const { format = 'json', tags } = req.query;
+    const filters = {};
+    if (tags) filters.tags = tags.split(',');
+    
+    const { contacts } = await MongoDBDataStore.getAllContacts(filters, 10000, 0);
+    
+    if (format === 'csv') {
+        const csvHeaders = 'Phone,Name,Email,Tags,Status,Created At,Last Updated\n';
+        const csvRows = contacts.map(c => 
+            `${c.phone},${c.name || ''},${c.email || ''},"${(c.tags || []).join(';')}",${c.status || 'active'},${c.created_at},${c.last_updated}`
+        ).join('\n');
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=contacts.csv');
+        res.send(csvHeaders + csvRows);
+    } else {
+        res.json(contacts);
+    }
+});
+
+// ─── Baileys Connection ───────────────────────────────────────────────────
 function getRetryDelay() {
     const delay = Math.min(1000 * Math.pow(2, retryCount), 30000);
     retryCount++;
@@ -903,7 +1466,6 @@ async function connectToWhatsApp() {
     isConnecting = true;
 
     try {
-        // Load saved auth state from MongoDB
         let savedState = await MongoDBDataStore.loadAuthState('whatsapp-auth');
         if (!savedState) {
             savedState = {};
@@ -928,7 +1490,6 @@ async function connectToWhatsApp() {
             markOnlineOnConnect: true,
         });
 
-        // Save credentials when updated
         sock.ev.on('creds.update', async (creds) => {
             await MongoDBDataStore.saveAuthState('whatsapp-auth', creds);
             console.log('[WA] Credentials saved to MongoDB');
@@ -962,11 +1523,8 @@ async function connectToWhatsApp() {
                 
                 console.log('[WA] Connected! Loading scheduled messages...');
                 
-                // Start scheduled message checker
                 if (global.scheduleInterval) clearInterval(global.scheduleInterval);
                 global.scheduleInterval = setInterval(checkScheduledMessages, 30000);
-                
-                // Run initial check
                 await checkScheduledMessages();
             }
 
@@ -990,7 +1548,7 @@ async function connectToWhatsApp() {
             }
         });
 
-        // Real-time message handler
+        // Real-time message handler with CRM integration
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type === 'notify') {
                 for (const msg of messages) {
@@ -999,6 +1557,7 @@ async function connectToWhatsApp() {
                     const jid = msg.key.remoteJid;
                     const isGroup = jid.includes('@g.us');
                     const sender = isGroup ? msg.key.participant : jid;
+                    const phone = sender.split('@')[0];
                     
                     let messageText = '';
                     let messageType = 'text';
@@ -1027,6 +1586,22 @@ async function connectToWhatsApp() {
                         timestamp: new Date(),
                         isGroup: isGroup,
                         fromMe: false
+                    });
+                    
+                    // Save to CRM conversation
+                    await MongoDBDataStore.saveConversation({
+                        phone: phone,
+                        message: messageText,
+                        direction: 'incoming',
+                        type: messageType,
+                        status: 'received'
+                    });
+                    
+                    // Auto-create or update contact
+                    await MongoDBDataStore.createOrUpdateContact({
+                        phone: phone,
+                        name: msg.pushName || null,
+                        last_message_at: new Date()
                     });
                     
                     console.log(`\n📨 [${isGroup ? 'GROUP' : 'PRIVATE'}] From: ${sender}`);
@@ -1065,140 +1640,53 @@ async function connectToWhatsApp() {
     }
 }
 
-// ─── Start Server ─────────────────────────────────────────────────────────
+// ─── Start Server with Self-Ping ─────────────────────────────────────────
 const server = app.listen(PORT, async () => {
     console.log(`\n🚀 =====================================`);
     console.log(`[Server] Running on port ${PORT}`);
     
-    // Connect to MongoDB
-    const dbConnected = await connectMongoDB();
-    if (dbConnected) {
-        console.log(`[MongoDB] ✅ Connected to MongoDB Atlas`);
-    } else {
-        console.log(`[MongoDB] ❌ Failed to connect to MongoDB Atlas`);
-        console.log(`[MongoDB] Please check your connection string and network access`);
-        console.log(`[MongoDB] Make sure your IP is whitelisted in MongoDB Atlas`);
-    }
+    await connectMongoDB();
     
     console.log(`[API] Endpoints available:`);
     console.log(`   GET  /health - Health check`);
     console.log(`   GET  /status - Bot status`);
-    console.log(`   POST /send - Send message (requires API_SECRET)`);
+    console.log(`   POST /send - Send message`);
     console.log(`   POST /schedule - Schedule message`);
     console.log(`   GET  /scheduled - List scheduled messages`);
-    console.log(`   GET  /history/:jid - Get message history`);
-    console.log(`   GET  /search/:jid - Search messages`);
-    console.log(`   GET  /stats - Get statistics`);
-    console.log(`   GET  /groups - List groups`);
-    console.log(`   POST /broadcast - Broadcast to groups`);
+    console.log(`   GET  /crm - CRM Dashboard`);
+    console.log(`   GET  /api/crm/contacts - List contacts`);
+    console.log(`   GET  /api/crm/campaigns - List campaigns`);
+    console.log(`   GET  /api/crm/templates - List templates`);
+    console.log(`   GET  /api/crm/analytics - View analytics`);
     console.log(`=====================================\n`);
     connectToWhatsApp();
 });
 
-// ─── Self-Ping to Keep Railway Awake ──────────────────────────────────────
-const SELF_PING_INTERVAL = 4 * 60 * 1000; // 4 minutes
+// Self-ping to keep Railway awake
+const SELF_PING_INTERVAL = 4 * 60 * 1000;
 let pingCount = 0;
-let lastPingStatus = 'unknown';
 
 async function selfPing() {
     try {
-        const url = `http://localhost:${PORT}/health`;
-        const response = await fetch(url);
-        
+        const response = await fetch(`http://localhost:${PORT}/health`);
         if (response.ok) {
-            const data = await response.json();
             pingCount++;
-            lastPingStatus = 'success';
-            console.log(`💓 [SELF-PING #${pingCount}] Success at ${new Date().toISOString()} - Status: ${data.whatsapp}, DB: ${data.database}`);
-        } else {
-            lastPingStatus = `failed (${response.status})`;
-            console.warn(`⚠️ [SELF-PING] Health check failed with status: ${response.status}`);
+            console.log(`💓 [SELF-PING #${pingCount}] Success at ${new Date().toISOString()}`);
         }
     } catch (err) {
-        lastPingStatus = `error: ${err.message}`;
         console.error(`❌ [SELF-PING] Error: ${err.message}`);
     }
 }
 
-console.log(`\n🔄 Self-ping system started - pinging every ${SELF_PING_INTERVAL / 1000} seconds to keep Railway awake`);
-selfPing(); // Immediate ping on startup
-const pingInterval = setInterval(selfPing, SELF_PING_INTERVAL);
+setInterval(selfPing, SELF_PING_INTERVAL);
+selfPing();
 
-// Initial aggressive pings for first 3 minutes
-let initialPingsDone = 0;
-const INITIAL_PING_COUNT = 6;
-const INITIAL_PING_INTERVAL = 30 * 1000;
-
-const initialPingInterval = setInterval(() => {
-    if (initialPingsDone < INITIAL_PING_COUNT) {
-        selfPing();
-        initialPingsDone++;
-        console.log(`[INITIAL] Aggressive ping ${initialPingsDone}/${INITIAL_PING_COUNT} completed`);
-    } else {
-        clearInterval(initialPingInterval);
-        console.log('[INITIAL] Aggressive ping phase completed');
-    }
-}, INITIAL_PING_INTERVAL);
-
-// Additional endpoint for ping stats
-app.get('/ping-stats', authCheck, (req, res) => {
-    res.json({
-        selfPing: {
-            enabled: true,
-            intervalSeconds: SELF_PING_INTERVAL / 1000,
-            totalPings: pingCount,
-            lastStatus: lastPingStatus,
-            lastPingTime: new Date().toISOString()
-        },
-        whatsapp: {
-            status: sessionStatus,
-            connected: sessionStatus === 'connected'
-        }
-    });
-});
-
-// ─── Graceful Shutdown ─────────────────────────────────────────────────────
+// Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n\n🛑 Shutting down gracefully...');
-    
-    if (pingInterval) clearInterval(pingInterval);
-    if (initialPingInterval) clearInterval(initialPingInterval);
     if (global.scheduleInterval) clearInterval(global.scheduleInterval);
-    
-    if (sock) {
-        console.log('[SHUTDOWN] Logging out from WhatsApp...');
-        try {
-            await sock.logout();
-            console.log('[SHUTDOWN] Successfully logged out');
-        } catch (err) {
-            console.error('[SHUTDOWN] Error during logout:', err.message);
-        }
-    }
-    
-    if (mongoClient) {
-        console.log('[SHUTDOWN] Closing MongoDB connection...');
-        await mongoClient.close();
-        console.log('[SHUTDOWN] MongoDB connection closed');
-    }
-    
-    server.close(() => {
-        console.log('[SHUTDOWN] Express server closed');
-        console.log('[SHUTDOWN] Goodbye! 👋');
-        process.exit(0);
-    });
-    
-    setTimeout(() => {
-        console.error('[SHUTDOWN] Forced exit after timeout');
-        process.exit(1);
-    }, 5000);
+    if (sock) await sock.logout();
+    if (mongoClient) await mongoClient.close();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000);
 });
-
-process.on('uncaughtException', (error) => {
-    console.error('[FATAL] Uncaught Exception:', error);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('[FATAL] Unhandled Rejection:', reason);
-});
-
-console.log('[INIT] Server initialized, waiting for WhatsApp connection...');
