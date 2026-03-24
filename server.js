@@ -1,12 +1,12 @@
 // server.js — Baileys WhatsApp microservice
-// Deploy this to Render as a Node.js web service
+// Deploy this to Railway as a Node.js web service
 
 const {
     default: makeWASocket,
     DisconnectReason,
     useMultiFileAuthState,
     fetchLatestBaileysVersion,
-    makeInMemoryStore
+    Browsers
 } = require('@whiskeysockets/baileys');
 
 const express = require('express');
@@ -17,7 +17,7 @@ const path    = require('path');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const PORT       = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET || 'changeme-set-this-in-render-dashboard';
+const API_SECRET = process.env.API_SECRET || 'changeme-set-this-in-railway-dashboard';
 const AUTH_DIR   = path.join(__dirname, 'auth_state');
 
 // ─── State ─────────────────────────────────────────────────────────────────
@@ -115,6 +115,14 @@ app.post('/logout', authCheck, async (req, res) => {
     res.json({ success: true, message: 'Logged out. New QR will be generated.' });
 });
 
+// ─── Retry delay (exponential backoff, max 30s) ────────────────────────────
+let retryCount = 0;
+function getRetryDelay() {
+    const delay = Math.min(1000 * Math.pow(2, retryCount), 30000);
+    retryCount++;
+    return delay;
+}
+
 // ─── Baileys connection logic ───────────────────────────────────────────────
 async function connectToWhatsApp() {
     if (isConnecting) return;
@@ -125,70 +133,88 @@ async function connectToWhatsApp() {
         fs.mkdirSync(AUTH_DIR, { recursive: true });
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version }          = await fetchLatestBaileysVersion();
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-    sock = makeWASocket({
-        version,
-        logger,
-        auth:            state,
-        printQRInTerminal: false,       // we handle QR ourselves
-        browser:         ['CRM', 'Chrome', '110.0.0'],
-        connectTimeoutMs: 60_000,
-        defaultQueryTimeoutMs: 60_000,
-        keepAliveIntervalMs:   25_000,  // keep WS alive inside Render
-    });
+        // Use a fixed known-good WA version instead of fetching latest
+        // fetchLatestBaileysVersion can fail on cloud servers with no browser
+        const version = [2, 3000, 1015901307];
 
-    // Save credentials whenever they update
-    sock.ev.on('creds.update', saveCreds);
+        sock = makeWASocket({
+            version,
+            logger,
+            auth:               state,
+            printQRInTerminal:  false,
+            // Use Baileys built-in Ubuntu browser fingerprint — less likely to be blocked
+            browser:            Browsers.ubuntu('Chrome'),
+            connectTimeoutMs:   60_000,
+            defaultQueryTimeoutMs: 60_000,
+            keepAliveIntervalMs:   10_000,
+            retryRequestDelayMs:   2_000,
+            maxMsgRetryCount:      3,
+            // Prevent Baileys from trying to sync full message history on cloud
+            syncFullHistory:    false,
+            markOnlineOnConnect: false,
+        });
 
-    // Handle QR generation
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        // Save credentials whenever they update
+        sock.ev.on('creds.update', saveCreds);
 
-        if (qr) {
-            sessionStatus = 'scanning';
-            currentQR     = null;
-            try {
-                // Convert QR string to base64 PNG for easy display in browser
-                currentQR = await qrcode.toDataURL(qr);
-                console.log('[WA] New QR generated — waiting for phone scan');
-            } catch (e) {
-                console.error('[WA] QR generation error:', e.message);
-            }
-        }
+        // Handle QR generation and connection state
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-        if (connection === 'open') {
-            sessionStatus = 'connected';
-            currentQR     = null;
-            isConnecting  = false;
-            console.log('[WA] Connected successfully!');
-        }
-
-        if (connection === 'close') {
-            isConnecting  = false;
-            const code    = lastDisconnect?.error?.output?.statusCode;
-            const reason  = DisconnectReason;
-
-            console.log('[WA] Disconnected, code:', code);
-
-            if (code === reason.loggedOut) {
-                // Phone explicitly logged out — clear keys, show new QR
-                console.log('[WA] Logged out by phone. Clearing session.');
-                if (fs.existsSync(AUTH_DIR)) {
-                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                }
-                sessionStatus = 'disconnected';
+            if (qr) {
+                sessionStatus = 'scanning';
                 currentQR     = null;
-                setTimeout(() => connectToWhatsApp(), 3000);
-            } else {
-                // Temporary disconnect — reconnect automatically
-                sessionStatus = 'disconnected';
-                console.log('[WA] Reconnecting in 5s...');
-                setTimeout(() => connectToWhatsApp(), 5000);
+                retryCount    = 0; // reset backoff on successful QR
+                try {
+                    currentQR = await qrcode.toDataURL(qr);
+                    console.log('[WA] New QR generated — waiting for phone scan');
+                } catch (e) {
+                    console.error('[WA] QR generation error:', e.message);
+                }
             }
-        }
-    });
+
+            if (connection === 'open') {
+                sessionStatus = 'connected';
+                currentQR     = null;
+                isConnecting  = false;
+                retryCount    = 0;
+                console.log('[WA] Connected successfully!');
+            }
+
+            if (connection === 'close') {
+                isConnecting = false;
+                const code   = lastDisconnect?.error?.output?.statusCode;
+
+                console.log('[WA] Disconnected, code:', code);
+
+                if (code === DisconnectReason.loggedOut) {
+                    console.log('[WA] Logged out by phone. Clearing session.');
+                    if (fs.existsSync(AUTH_DIR)) {
+                        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    }
+                    sessionStatus = 'disconnected';
+                    currentQR     = null;
+                    retryCount    = 0;
+                    setTimeout(() => connectToWhatsApp(), 3000);
+                } else {
+                    sessionStatus = 'disconnected';
+                    const delay   = getRetryDelay();
+                    console.log(`[WA] Reconnecting in ${delay / 1000}s... (attempt ${retryCount})`);
+                    setTimeout(() => connectToWhatsApp(), delay);
+                }
+            }
+        });
+
+    } catch (err) {
+        isConnecting  = false;
+        const delay   = getRetryDelay();
+        console.error('[WA] Setup error:', err.message);
+        console.log(`[WA] Retrying in ${delay / 1000}s...`);
+        setTimeout(() => connectToWhatsApp(), delay);
+    }
 }
 
 // ─── Start ─────────────────────────────────────────────────────────────────
