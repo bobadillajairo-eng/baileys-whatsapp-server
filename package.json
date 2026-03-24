@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Baileys WhatsApp session microservice for CRM",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
