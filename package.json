@@ -2,10 +2,10 @@
   "name": "whatsapp-bot",
   "version": "1.0.0",
   "description": "WhatsApp bot with real-time sync and scheduled messages",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
