@@ -2,6 +2,7 @@
 import makeWASocket, {
     DisconnectReason,
     useMultiFileAuthState,
+    fetchLatestBaileysVersion,
     Browsers
 } from '@whiskeysockets/baileys';
 
@@ -99,21 +100,23 @@ async function connectToWhatsApp() {
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
     try {
-        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+        const { state, saveCreds }   = await useMultiFileAuthState(AUTH_DIR);
+        const { version, isLatest }  = await fetchLatestBaileysVersion();
+        console.log(`[WA] Using WA version ${version.join('.')} — isLatest: ${isLatest}`);
 
         sock = makeWASocket({
-            version:                  [2, 3000, 1015901307],
+            version,
             logger,
-            auth:                     state,
-            printQRInTerminal:        false,
-            browser:                  Browsers.ubuntu('Chrome'),
-            connectTimeoutMs:         60_000,
-            defaultQueryTimeoutMs:    60_000,
-            keepAliveIntervalMs:      10_000,
-            retryRequestDelayMs:      2_000,
-            maxMsgRetryCount:         3,
-            syncFullHistory:          false,
-            markOnlineOnConnect:      false,
+            auth:                  state,
+            printQRInTerminal:     false,
+            browser:               Browsers.ubuntu('Chrome'),
+            connectTimeoutMs:      60_000,
+            defaultQueryTimeoutMs: 60_000,
+            keepAliveIntervalMs:   10_000,
+            retryRequestDelayMs:   2_000,
+            maxMsgRetryCount:      3,
+            syncFullHistory:       false,
+            markOnlineOnConnect:   false,
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -142,8 +145,8 @@ async function connectToWhatsApp() {
             }
 
             if (connection === 'close') {
-                isConnecting  = false;
-                const code    = lastDisconnect?.error?.output?.statusCode;
+                isConnecting = false;
+                const code   = lastDisconnect?.error?.output?.statusCode;
                 console.log('[WA] Disconnected, code:', code);
 
                 if (code === DisconnectReason.loggedOut) {
