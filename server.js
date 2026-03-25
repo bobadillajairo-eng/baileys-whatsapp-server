@@ -6,22 +6,19 @@ import makeWASocket, {
     Browsers
 } from '@whiskeysockets/baileys';
 
-import express  from 'express';
-import qrcode   from 'qrcode';
-import pino     from 'pino';
-import fs       from 'fs';
-import path     from 'path';
-import https    from 'https';
-import http     from 'http';
+import express from 'express';
+import qrcode  from 'qrcode';
+import pino    from 'pino';
+import fs      from 'fs';
+import path    from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const PORT         = process.env.PORT       || 3000;
-const API_SECRET   = process.env.API_SECRET || 'changeme-set-this-in-railway-dashboard';
-const WEBHOOK_URL  = process.env.WEBHOOK_URL || '';   // e.g. https://bodega.mircalderonmayoreo.com/aiDeepSeek/wa_webhook.php
-const AUTH_DIR     = path.join(__dirname, 'auth_state');
+const PORT       = process.env.PORT       || 3000;
+const API_SECRET = process.env.API_SECRET || 'changeme-set-this-in-railway-dashboard';
+const AUTH_DIR   = path.join(__dirname, 'auth_state');
 
 // ─── State ─────────────────────────────────────────────────────────────────
 let sock          = null;
@@ -29,6 +26,11 @@ let currentQR     = null;
 let sessionStatus = 'disconnected';
 let isConnecting  = false;
 let retryCount    = 0;
+
+// ─── Message queue (in-memory) ─────────────────────────────────────────────
+// PHP polls GET /messages to pick these up, then ACKs them
+let messageQueue = [];
+let messageSeq   = 0; // ever-incrementing ID so PHP can dedup
 
 // ─── Logger ────────────────────────────────────────────────────────────────
 const logger = pino({ level: 'silent' });
@@ -45,8 +47,9 @@ function authCheck(req, res, next) {
 }
 
 // ─── Routes ────────────────────────────────────────────────────────────────
+
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', whatsapp: sessionStatus });
+    res.json({ status: 'ok', whatsapp: sessionStatus, queued: messageQueue.length });
 });
 
 app.get('/qr', authCheck, (req, res) => {
@@ -57,6 +60,23 @@ app.get('/qr', authCheck, (req, res) => {
 
 app.get('/status', authCheck, (req, res) => {
     res.json({ status: sessionStatus });
+});
+
+// PHP polls this to get pending inbound messages
+app.get('/messages', authCheck, (req, res) => {
+    res.json({ messages: messageQueue });
+});
+
+// PHP calls this after processing messages to clear the queue
+// Body: { ids: [1, 2, 3] }
+app.post('/messages/ack', authCheck, (req, res) => {
+    const { ids } = req.body;
+    if (!Array.isArray(ids)) {
+        return res.status(400).json({ error: 'ids must be an array' });
+    }
+    const before = messageQueue.length;
+    messageQueue = messageQueue.filter(m => !ids.includes(m.seq));
+    res.json({ removed: before - messageQueue.length, remaining: messageQueue.length });
 });
 
 app.post('/send', authCheck, async (req, res) => {
@@ -85,43 +105,10 @@ app.post('/logout', authCheck, async (req, res) => {
     sock          = null;
     isConnecting  = false;
     retryCount    = 0;
+    messageQueue  = [];
     setTimeout(() => connectToWhatsApp(), 1000);
     res.json({ success: true, message: 'Logged out. New QR will be generated.' });
 });
-
-// ─── Webhook forwarder ─────────────────────────────────────────────────────
-// Forwards every inbound WhatsApp message to wa_webhook.php on IONOS
-function forwardToWebhook(payload) {
-    if (!WEBHOOK_URL) return;
-
-    const body = JSON.stringify(payload);
-    const urlObj = new URL(WEBHOOK_URL);
-    const isHttps = urlObj.protocol === 'https:';
-    const lib = isHttps ? https : http;
-
-    const options = {
-        hostname: urlObj.hostname,
-        port:     urlObj.port || (isHttps ? 443 : 80),
-        path:     urlObj.pathname,
-        method:   'POST',
-        headers: {
-            'Content-Type':   'application/json',
-            'Content-Length': Buffer.byteLength(body),
-            'x-api-secret':   API_SECRET,
-        },
-    };
-
-    const req = lib.request(options, (res) => {
-        console.log(`[Webhook] Forwarded to CRM — HTTP ${res.statusCode}`);
-    });
-
-    req.on('error', (e) => {
-        console.error('[Webhook] Forward error:', e.message);
-    });
-
-    req.write(body);
-    req.end();
-}
 
 // ─── Retry delay ───────────────────────────────────────────────────────────
 function getRetryDelay() {
@@ -159,23 +146,18 @@ async function connectToWhatsApp() {
 
         sock.ev.on('creds.update', saveCreds);
 
-        // ── Incoming messages ───────────────────────────────────────────────
+        // ── Incoming messages → queue ───────────────────────────────────────
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            // 'notify' = new message arriving, 'append' = history sync — ignore append
             if (type !== 'notify') return;
 
             for (const msg of messages) {
-                // Skip messages sent by us
                 if (msg.key.fromMe) continue;
 
-                // Only handle individual chats (not groups)
                 const jid = msg.key.remoteJid;
                 if (!jid || jid.endsWith('@g.us')) continue;
 
-                // Extract phone number (strip @s.whatsapp.net and any suffix)
                 const phone = jid.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
 
-                // Extract message text (handle different message types)
                 const body =
                     msg.message?.conversation ||
                     msg.message?.extendedTextMessage?.text ||
@@ -183,24 +165,31 @@ async function connectToWhatsApp() {
                     msg.message?.videoMessage?.caption ||
                     '[media]';
 
-                // Determine message type
                 let msgType = 'text';
                 if (msg.message?.imageMessage)    msgType = 'image';
                 if (msg.message?.audioMessage)    msgType = 'audio';
                 if (msg.message?.videoMessage)    msgType = 'video';
                 if (msg.message?.documentMessage) msgType = 'document';
 
-                const payload = {
-                    baileys_id:    msg.key.id,
+                messageSeq++;
+                const queueItem = {
+                    seq:          messageSeq,
+                    baileys_id:   msg.key.id,
                     phone,
-                    contact_name:  msg.pushName || '',
+                    contact_name: msg.pushName || '',
                     body,
-                    msg_type:      msgType,
-                    timestamp:     msg.messageTimestamp,
+                    msg_type:     msgType,
+                    timestamp:    msg.messageTimestamp,
                 };
 
-                console.log(`[WA] Inbound from ${phone}: ${body.substring(0, 60)}`);
-                forwardToWebhook(payload);
+                messageQueue.push(queueItem);
+
+                // Keep queue from growing unbounded (max 200 messages)
+                if (messageQueue.length > 200) {
+                    messageQueue = messageQueue.slice(-200);
+                }
+
+                console.log(`[WA] Queued inbound from ${phone}: ${body.substring(0, 60)} (seq:${messageSeq})`);
             }
         });
 
@@ -259,6 +248,6 @@ async function connectToWhatsApp() {
 // ─── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`[Server] Running on port ${PORT}`);
-    console.log(`[Server] Webhook URL: ${WEBHOOK_URL || 'NOT SET — inbound messages will not be forwarded'}`);
+    console.log(`[Server] Pull-mode queue active — PHP polls /messages to fetch inbound`);
     connectToWhatsApp();
 });
