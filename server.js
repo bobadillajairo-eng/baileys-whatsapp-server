@@ -27,7 +27,7 @@ const AUTH_DIR   = path.join(__dirname, 'auth_state');
 const DB_CONFIG = {
     host: process.env.DB_HOST || 'db5019972151.hosting-data.io',
     user: process.env.DB_USER || 'dbu165976',
-    password: process.env.DB_PASSWORD || 'J0528B1994',
+    password: process.env.DB_PASSWORD || 'J0528B1994?',
     database: process.env.DB_NAME || 'dbs15415260',
     waitForConnections: true,
     connectionLimit: 10
