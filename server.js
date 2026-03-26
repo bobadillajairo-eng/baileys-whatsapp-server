@@ -3,8 +3,7 @@ import makeWASocket, {
     DisconnectReason,
     useMultiFileAuthState,
     fetchLatestBaileysVersion,
-    Browsers,
-    makeInMemoryStore
+    Browsers
 } from '@whiskeysockets/baileys';
 
 import express from 'express';
@@ -28,13 +27,50 @@ let sessionStatus = 'disconnected';
 let isConnecting  = false;
 let retryCount    = 0;
 
-// ─── Message queue (inbound messages PHP polls) ────────────────────────────
+// ─── Message queue (inbound — PHP polls this) ──────────────────────────────
 let messageQueue = [];
 let messageSeq   = 0;
 
-// ─── In-memory store (holds full chat + message history) ──────────────────
+// ─── Simple history store (replaces makeInMemoryStore) ────────────────────
+// key: phone number, value: array of message objects
+const historyStore = {};
+
+function storeMessage(phone, msg, fromMe) {
+    if (!historyStore[phone]) historyStore[phone] = [];
+
+    const body =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.imageMessage?.caption ||
+        msg.message?.videoMessage?.caption ||
+        null;
+
+    if (!body) return; // skip media with no caption
+
+    let msgType = 'text';
+    if (msg.message?.imageMessage)    msgType = 'image';
+    if (msg.message?.audioMessage)    msgType = 'audio';
+    if (msg.message?.videoMessage)    msgType = 'video';
+    if (msg.message?.documentMessage) msgType = 'document';
+
+    historyStore[phone].push({
+        baileys_id:   msg.key.id,
+        phone,
+        contact_name: msg.pushName || '',
+        body,
+        msg_type:     msgType,
+        from_me:      fromMe ? 1 : 0,
+        timestamp:    msg.messageTimestamp,
+    });
+
+    // Cap per-contact history at 1000 messages
+    if (historyStore[phone].length > 1000) {
+        historyStore[phone] = historyStore[phone].slice(-1000);
+    }
+}
+
+// ─── Logger ────────────────────────────────────────────────────────────────
 const logger = pino({ level: 'silent' });
-const store  = makeInMemoryStore({ logger });
 
 // ─── Express ───────────────────────────────────────────────────────────────
 const app = express();
@@ -49,7 +85,9 @@ function authCheck(req, res, next) {
 
 // ─── Routes ────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', whatsapp: sessionStatus, queued: messageQueue.length });
+    const phones  = Object.keys(historyStore).length;
+    const total   = Object.values(historyStore).reduce((s, a) => s + a.length, 0);
+    res.json({ status: 'ok', whatsapp: sessionStatus, queued: messageQueue.length, stored_chats: phones, stored_msgs: total });
 });
 
 app.get('/qr', authCheck, (req, res) => {
@@ -62,7 +100,7 @@ app.get('/status', authCheck, (req, res) => {
     res.json({ status: sessionStatus });
 });
 
-// PHP polls this to get pending inbound messages
+// PHP polls this for live inbound messages
 app.get('/messages', authCheck, (req, res) => {
     res.json({ messages: messageQueue });
 });
@@ -71,15 +109,13 @@ app.get('/messages', authCheck, (req, res) => {
 app.post('/messages/ack', authCheck, (req, res) => {
     const { ids } = req.body;
     if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids must be an array' });
-    const before  = messageQueue.length;
-    messageQueue  = messageQueue.filter(m => !ids.includes(m.seq));
+    const before = messageQueue.length;
+    messageQueue = messageQueue.filter(m => !ids.includes(m.seq));
     res.json({ removed: before - messageQueue.length, remaining: messageQueue.length });
 });
 
-// ── Full history sync endpoint ─────────────────────────────────────────────
-// PHP calls this once to get ALL stored messages from the in-memory store
-// Supports pagination: ?offset=0&limit=200
-app.get('/sync', authCheck, async (req, res) => {
+// Full history sync — PHP calls this once to import all stored messages
+app.get('/sync', authCheck, (req, res) => {
     if (sessionStatus !== 'connected') {
         return res.status(503).json({ error: 'WhatsApp not connected' });
     }
@@ -87,75 +123,18 @@ app.get('/sync', authCheck, async (req, res) => {
     const offset = parseInt(req.query.offset) || 0;
     const limit  = parseInt(req.query.limit)  || 200;
 
-    try {
-        const allMessages = [];
-
-        // Iterate all chats stored in memory
-        const chats = store.chats.all();
-
-        for (const chat of chats) {
-            const jid = chat.id;
-
-            // Skip groups
-            if (jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
-
-            const phone = jid.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
-            if (!phone) continue;
-
-            // Get messages for this chat from store
-            const chatMsgs = store.messages[jid];
-            if (!chatMsgs) continue;
-
-            const msgArray = chatMsgs.array || [];
-
-            for (const msg of msgArray) {
-                if (!msg.message) continue;
-
-                const body =
-                    msg.message?.conversation ||
-                    msg.message?.extendedTextMessage?.text ||
-                    msg.message?.imageMessage?.caption ||
-                    msg.message?.videoMessage?.caption ||
-                    null;
-
-                if (!body) continue; // skip media-only with no caption
-
-                let msgType = 'text';
-                if (msg.message?.imageMessage)    msgType = 'image';
-                if (msg.message?.audioMessage)    msgType = 'audio';
-                if (msg.message?.videoMessage)    msgType = 'video';
-                if (msg.message?.documentMessage) msgType = 'document';
-
-                allMessages.push({
-                    baileys_id:   msg.key.id,
-                    phone,
-                    contact_name: '', // store doesn't reliably have pushName
-                    body,
-                    msg_type:     msgType,
-                    from_me:      msg.key.fromMe ? 1 : 0,
-                    timestamp:    msg.messageTimestamp,
-                });
-            }
-        }
-
-        // Sort oldest first
-        allMessages.sort((a, b) => a.timestamp - b.timestamp);
-
-        const total  = allMessages.length;
-        const sliced = allMessages.slice(offset, offset + limit);
-
-        res.json({
-            total,
-            offset,
-            limit,
-            has_more: (offset + limit) < total,
-            messages: sliced,
-        });
-
-    } catch (err) {
-        console.error('[Sync] Error:', err.message);
-        res.status(500).json({ error: err.message });
+    // Flatten all messages from all chats, sort oldest first
+    const all = [];
+    for (const msgs of Object.values(historyStore)) {
+        for (const m of msgs) all.push(m);
     }
+    all.sort((a, b) => a.timestamp - b.timestamp);
+
+    const total   = all.length;
+    const sliced  = all.slice(offset, offset + limit);
+    const hasMore = (offset + limit) < total;
+
+    res.json({ total, offset, limit, has_more: hasMore, messages: sliced });
 });
 
 app.post('/send', authCheck, async (req, res) => {
@@ -217,54 +196,54 @@ async function connectToWhatsApp() {
             keepAliveIntervalMs:   10_000,
             retryRequestDelayMs:   2_000,
             maxMsgRetryCount:      3,
-            syncFullHistory:       true,   // load full message history
+            syncFullHistory:       true,
             markOnlineOnConnect:   false,
         });
 
-        // Bind store to socket — this makes store capture all events automatically
-        store.bind(sock.ev);
-
         sock.ev.on('creds.update', saveCreds);
 
-        // ── Incoming messages → queue ───────────────────────────────────────
+        // ── Capture ALL messages (history + live) into historyStore ─────────
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-
             for (const msg of messages) {
-                if (msg.key.fromMe) continue;
-
                 const jid = msg.key.remoteJid;
-                if (!jid || jid.endsWith('@g.us')) continue;
+                if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+                if (!msg.message) continue;
 
-                const phone = jid.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
+                const phone   = jid.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
+                const fromMe  = msg.key.fromMe;
 
-                const body =
-                    msg.message?.conversation ||
-                    msg.message?.extendedTextMessage?.text ||
-                    msg.message?.imageMessage?.caption ||
-                    msg.message?.videoMessage?.caption ||
-                    '[media]';
+                // Store every message (history + live) for /sync
+                storeMessage(phone, msg, fromMe);
 
-                let msgType = 'text';
-                if (msg.message?.imageMessage)    msgType = 'image';
-                if (msg.message?.audioMessage)    msgType = 'audio';
-                if (msg.message?.videoMessage)    msgType = 'video';
-                if (msg.message?.documentMessage) msgType = 'document';
+                // Only queue LIVE inbound messages for real-time processing
+                if (type === 'notify' && !fromMe) {
+                    const body =
+                        msg.message?.conversation ||
+                        msg.message?.extendedTextMessage?.text ||
+                        msg.message?.imageMessage?.caption ||
+                        msg.message?.videoMessage?.caption ||
+                        '[media]';
 
-                messageSeq++;
-                messageQueue.push({
-                    seq:          messageSeq,
-                    baileys_id:   msg.key.id,
-                    phone,
-                    contact_name: msg.pushName || '',
-                    body,
-                    msg_type:     msgType,
-                    timestamp:    msg.messageTimestamp,
-                });
+                    let msgType = 'text';
+                    if (msg.message?.imageMessage)    msgType = 'image';
+                    if (msg.message?.audioMessage)    msgType = 'audio';
+                    if (msg.message?.videoMessage)    msgType = 'video';
+                    if (msg.message?.documentMessage) msgType = 'document';
 
-                if (messageQueue.length > 200) messageQueue = messageQueue.slice(-200);
+                    messageSeq++;
+                    messageQueue.push({
+                        seq:          messageSeq,
+                        baileys_id:   msg.key.id,
+                        phone,
+                        contact_name: msg.pushName || '',
+                        body,
+                        msg_type:     msgType,
+                        timestamp:    msg.messageTimestamp,
+                    });
 
-                console.log(`[WA] Queued inbound from ${phone}: ${body.substring(0, 60)}`);
+                    if (messageQueue.length > 200) messageQueue = messageQueue.slice(-200);
+                    console.log(`[WA] Live inbound from ${phone}: ${body.substring(0, 60)}`);
+                }
             }
         });
 
@@ -289,7 +268,7 @@ async function connectToWhatsApp() {
                 currentQR     = null;
                 isConnecting  = false;
                 retryCount    = 0;
-                console.log('[WA] Connected! History sync available at /sync');
+                console.log('[WA] Connected! Syncing history into store...');
             }
 
             if (connection === 'close') {
