@@ -20,15 +20,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const PORT       = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET || 'changeme-set-this-in-railway-dashboard';
+const API_SECRET = process.env.API_SECRET || 'mircalderon_wa_2026_xk9q';
 const AUTH_DIR   = path.join(__dirname, 'auth_state');
 
 // Database configuration
 const DB_CONFIG = {
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'crm_db',
+    host: process.env.DB_HOST || 'db5019972151.hosting-data.io',
+    user: process.env.DB_USER || 'dbu165976',
+    password: process.env.DB_PASSWORD || 'J0528B1994?',
+    database: process.env.DB_NAME || 'dbs15415260',
     waitForConnections: true,
     connectionLimit: 10,
     enableKeepAlive: true,
