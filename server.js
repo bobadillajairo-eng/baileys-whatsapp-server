@@ -24,15 +24,18 @@ const API_SECRET = process.env.API_SECRET || 'mircalderon_wa_2026_xk9q';
 const AUTH_DIR   = path.join(__dirname, 'auth_state');
 
 // Database configuration
+// Update DB_CONFIG section in your server.js
 const DB_CONFIG = {
-    host: process.env.DB_HOST || 'db5019972151.hosting-data.io',
-    user: process.env.DB_USER || 'dbu165976',
-    password: process.env.DB_PASSWORD || 'J0528B1994?',
-    database: process.env.DB_NAME || 'dbs15415260',
+    host: process.env.MYSQL_HOST || process.env.DB_HOST || 'mysql.railway.internal',
+    user: process.env.MYSQL_USER || process.env.DB_USER || 'root',
+    password: process.env.MYSQL_PASSWORD || process.env.DB_PASSWORD || '',
+    database: process.env.MYSQL_DATABASE || process.env.DB_NAME || 'railway',
+    port: parseInt(process.env.MYSQL_PORT || process.env.DB_PORT || '3306'),
     waitForConnections: true,
     connectionLimit: 10,
     enableKeepAlive: true,
-    keepAliveInitialDelay: 0
+    connectTimeout: 30000,
+    acquireTimeout: 30000
 };
 
 // ─── State ─────────────────────────────────────────────────────────────────
