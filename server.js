@@ -20,7 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT       = process.env.PORT       || 3000;
 const API_SECRET = process.env.API_SECRET || 'mircalderon_wa_2026_xk9q';
 const AUTH_DIR   = path.join(__dirname, 'auth_state');
-const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://bodega.mircalderonmayoreo.com/webhook.php';
+const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://bodega.mircalderonmayoreo.com/api/webhook.php';
 
 // ─── State ─────────────────────────────────────────────────────────────────
 let sock          = null;
