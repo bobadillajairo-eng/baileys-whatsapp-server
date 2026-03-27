@@ -66,7 +66,7 @@ function extractType(msg) {
     return 'text';
 }
 
-// Replace the formatPhoneNumber function in server.js with this improved version
+// ─── Improved Phone Number Formatter ───────────────────────────────────────
 function formatPhoneNumber(rawJid) {
     try {
         // Remove @s.whatsapp.net if present
@@ -75,17 +75,24 @@ function formatPhoneNumber(rawJid) {
         // Remove any non-digit characters
         let digits = phone.replace(/[^0-9]/g, '');
         
+        // If empty, return original
+        if (!digits) return rawJid;
+        
         // WhatsApp numbers can be in various formats:
         // - 521234567890 (Mexico with country code)
         // - 1234567890 (without country code)
         // - 521234567890@s.whatsapp.net (full JID)
+        // - +521234567890 (with plus)
         
-        // If the number is 10 digits (Mexico local), add +52
+        // Remove any leading zeros
+        digits = digits.replace(/^0+/, '');
+        
+        // If the number is 10 digits (Mexico local without country code), add +52
         if (digits.length === 10) {
             digits = '52' + digits;
         }
         
-        // If the number is 11 digits starting with 52, that's Mexico format
+        // If the number is 11 digits and starts with 52, it's Mexico format
         // If it's 12 digits or more, it might have extra digits - trim to reasonable length
         if (digits.length > 13) {
             // WhatsApp numbers are typically max 13 digits with country code
@@ -93,7 +100,12 @@ function formatPhoneNumber(rawJid) {
             digits = digits.slice(-13);
         }
         
-        // Add plus sign
+        // If digits start with 52 but no plus, add plus
+        if (digits.startsWith('52')) {
+            return '+' + digits;
+        }
+        
+        // Add plus sign for all numbers
         return '+' + digits;
     } catch (error) {
         console.error('[WA] Phone formatting error:', error);
@@ -132,7 +144,7 @@ function storeMessage(phone, msg) {
 async function sendToPHPWebhook(messageData) {
     try {
         console.log(`[Webhook] Sending to: ${PHP_WEBHOOK_URL}`);
-        console.log(`[Webhook] Data:`, JSON.stringify(messageData).substring(0, 200));
+        console.log(`[Webhook] Data:`, JSON.stringify(messageData).substring(0, 300));
         
         const response = await axios.post(PHP_WEBHOOK_URL, messageData, {
             headers: {
@@ -439,18 +451,14 @@ async function connectToWhatsApp() {
                 if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
                 if (!msg.message) continue;
 
-                // Extract and format phone number
-                let phone = jid.replace('@s.whatsapp.net', '');
-                phone = phone.replace(/[^0-9]/g, '');
-                if (phone.length >= 10) {
-                    phone = '+' + phone;
-                }
-                
+                // Format phone number using improved formatter
+                const formattedPhone = formatPhoneNumber(jid);
                 const fromMe = msg.key?.fromMe || false;
                 
-                console.log(`[WA] Message from: ${phone} (fromMe: ${fromMe})`);
+                console.log(`[WA] Original JID: ${jid}`);
+                console.log(`[WA] Formatted phone: ${formattedPhone}`);
 
-                storeMessage(phone, msg);
+                storeMessage(formattedPhone, msg);
 
                 // Process inbound messages (not from me)
                 if (type === 'notify' && !fromMe) {
@@ -461,7 +469,7 @@ async function connectToWhatsApp() {
                     const queuedMsg = {
                         seq: messageSeq,
                         baileys_id: msg.key.id,
-                        phone: phone,
+                        phone: formattedPhone,
                         contact_name: msg.pushName || '',
                         body: body,
                         msg_type: extractType(msg),
@@ -470,13 +478,13 @@ async function connectToWhatsApp() {
                     messageQueue.push(queuedMsg);
                     
                     if (messageQueue.length > 200) messageQueue = messageQueue.slice(-200);
-                    console.log(`[WA] Inbound from ${phone}: ${body.substring(0, 50)}`);
+                    console.log(`[WA] Inbound from ${formattedPhone}: ${body.substring(0, 50)}`);
 
-                    // Send to PHP webhook
+                    // Send to PHP webhook with formatted phone number
                     const webhookData = {
                         message: {
                             id: msg.key.id,
-                            from: phone,
+                            from: formattedPhone,
                             text: body,
                             type: extractType(msg),
                             timestamp: msg.messageTimestamp,
@@ -492,8 +500,8 @@ async function connectToWhatsApp() {
                 if (type === 'notify' && fromMe) {
                     const body = extractBody(msg);
                     if (body) {
-                        console.log(`[WA] Outbound to ${phone}: ${body.substring(0, 50)}`);
-                        await logOutboundToPHP(phone, body, 'sent', null, null, msg.key.id, { source: 'manual' });
+                        console.log(`[WA] Outbound to ${formattedPhone}: ${body.substring(0, 50)}`);
+                        await logOutboundToPHP(formattedPhone, body, 'sent', null, null, msg.key.id, { source: 'manual' });
                     }
                 }
             }
@@ -519,7 +527,7 @@ async function connectToWhatsApp() {
                 currentQR = null;
                 isConnecting = false;
                 retryCount = 0;
-                console.log('[WA] Connected!');
+                console.log('[WA] Connected! Ready to receive and send messages.');
             }
 
             if (connection === 'close') {
@@ -555,5 +563,6 @@ app.listen(PORT, () => {
     console.log(`[Server] Running on port ${PORT}`);
     console.log(`[Server] Webhook URL: ${PHP_WEBHOOK_URL}`);
     console.log(`[Server] API Secret: ${API_SECRET.substring(0, 10)}...`);
+    console.log(`[Server] Phone format: International format with country code (+521234567890)`);
     connectToWhatsApp();
 });
