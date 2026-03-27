@@ -20,7 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const PORT       = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET || 'changeme-set-this-in-railway-dashboard';
+const API_SECRET = process.env.API_SECRET || 'mircalderon_wa_2026_xk9q';
 const AUTH_DIR   = path.join(__dirname, 'auth_state');
 
 // Database configuration - Use Railway MySQL variables
