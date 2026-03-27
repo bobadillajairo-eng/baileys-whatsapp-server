@@ -66,37 +66,26 @@ function extractType(msg) {
     return 'text';
 }
 
-// ─── Format phone number - Remove JID format, add country code ────────────
+// Simple phone formatter that just removes @s.whatsapp.net and adds +
 function formatPhoneNumber(rawJid) {
-    // Remove @s.whatsapp.net if present
-    let phone = rawJid.replace('@s.whatsapp.net', '');
-    
-    // Remove any non-digit characters (except plus sign)
-    phone = phone.replace(/[^0-9+]/g, '');
-    
-    // If it already has a plus sign, keep it
-    if (phone.startsWith('+')) {
+    try {
+        // Remove @s.whatsapp.net if present
+        let phone = rawJid.replace('@s.whatsapp.net', '');
+        
+        // Remove any non-digit characters
+        phone = phone.replace(/[^0-9]/g, '');
+        
+        // If it's a valid number, add + prefix
+        if (phone.length >= 10) {
+            return '+' + phone;
+        }
+        
+        // Return as is if can't format
         return phone;
+    } catch (error) {
+        console.error('[WA] Phone formatting error:', error);
+        return rawJid;
     }
-    
-    // If it's just digits (no plus sign)
-    // Remove any leading zeros
-    phone = phone.replace(/^0+/, '');
-    
-    // For Mexico: if phone is 10 digits, add +52
-    if (phone.length === 10) {
-        phone = '+52' + phone;
-    }
-    // For Mexico: if phone is 11 digits starting with 52, add +
-    else if (phone.length === 11 && phone.startsWith('52')) {
-        phone = '+' + phone;
-    }
-    // For other countries: just add plus sign
-    else if (phone.length >= 10) {
-        phone = '+' + phone;
-    }
-    
-    return phone;
 }
 
 function storeMessage(phone, msg) {
@@ -129,18 +118,21 @@ function storeMessage(phone, msg) {
 // ─── Send inbound message to PHP webhook ───────────────────────────────────
 async function sendToPHPWebhook(messageData) {
     try {
+        console.log(`[Webhook] Sending to: ${PHP_WEBHOOK_URL}`);
+        console.log(`[Webhook] Data:`, JSON.stringify(messageData).substring(0, 200));
+        
         const response = await axios.post(PHP_WEBHOOK_URL, messageData, {
             headers: {
                 'Content-Type': 'application/json',
                 'X-API-Secret': API_SECRET
             },
-            timeout: 5000
+            timeout: 10000
         });
         
-        console.log(`[Webhook] Inbound message logged to PHP: ${response.data?.message || 'Success'}`);
+        console.log(`[Webhook] Success: ${response.data?.message || 'Logged'}`);
         return true;
     } catch (error) {
-        console.error(`[Webhook] Failed to send inbound to PHP:`, error.message);
+        console.error(`[Webhook] ERROR:`, error.message);
         if (error.response) {
             console.error(`[Webhook] Response status: ${error.response.status}`);
             console.error(`[Webhook] Response data:`, error.response.data);
@@ -173,10 +165,10 @@ async function logOutboundToPHP(phone, message, status, invoiceId = null, custom
             timeout: 5000
         });
         
-        console.log(`[Webhook] Outbound message logged to PHP for ${phone} (${status})`);
+        console.log(`[Webhook] Outbound logged: ${phone} (${status})`);
         return true;
     } catch (error) {
-        console.error(`[Webhook] Failed to log outbound message:`, error.message);
+        console.error(`[Webhook] Outbound log error:`, error.message);
         return false;
     }
 }
@@ -284,18 +276,12 @@ app.get('/sync', authCheck, (req, res) => {
     res.json({ total, offset, limit, has_more: hasMore, messages: sliced });
 });
 
-// ─── Test Webhook Endpoint ────────────────────────────────────────────────
 app.get('/test-webhook', authCheck, (req, res) => {
     res.json({ 
         success: true, 
         message: 'Webhook test successful',
         status: sessionStatus,
-        timestamp: new Date().toISOString(),
-        endpoints: {
-            health: '/health',
-            status: '/status',
-            webhook: PHP_WEBHOOK_URL
-        }
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -309,7 +295,6 @@ app.post('/test-webhook', authCheck, (req, res) => {
     });
 });
 
-// ─── Send message endpoint ────────────────────────────────────────────────
 app.post('/send', authCheck, async (req, res) => {
     if (sessionStatus !== 'connected') {
         return res.status(503).json({ error: 'WhatsApp not connected', status: sessionStatus });
@@ -322,7 +307,6 @@ app.post('/send', authCheck, async (req, res) => {
     }
     
     try {
-        // Format phone number - ensure it's in JID format for sending
         let jid = phone.toString().replace(/\D/g, '');
         if (!jid.endsWith('@s.whatsapp.net')) {
             jid = jid + '@s.whatsapp.net';
@@ -331,31 +315,18 @@ app.post('/send', authCheck, async (req, res) => {
         const result = await sock.sendMessage(jid, { text: message });
         const messageId = result.key?.id;
         
-        console.log(`[Send] Message sent to ${phone}${invoice_id ? ` (Invoice: ${invoice_id})` : ''}`);
+        console.log(`[Send] Sent to ${phone}`);
         
-        logOutboundToPHP(phone, message, 'sent', invoice_id, customer_id, messageId, result).catch(err => {
-            console.error('[Send] Failed to log to webhook:', err.message);
-        });
+        logOutboundToPHP(phone, message, 'sent', invoice_id, customer_id, messageId, result);
         
-        res.json({ 
-            success: true, 
-            to: jid,
-            invoice_id: invoice_id || null,
-            customer_id: customer_id || null,
-            message_id: messageId
-        });
+        res.json({ success: true, message_id: messageId });
     } catch (err) {
         console.error('[Send] Error:', err.message);
-        
-        logOutboundToPHP(phone, message, 'failed', invoice_id, customer_id, null, { error: err.message }).catch(err => {
-            console.error('[Send] Failed to log error to webhook:', err.message);
-        });
-        
+        logOutboundToPHP(phone, message, 'failed', invoice_id, customer_id, null, { error: err.message });
         res.status(500).json({ error: err.message });
     }
 });
 
-// ─── Bulk send endpoint ────────────────────────────────────────────────────
 app.post('/send-bulk', authCheck, async (req, res) => {
     if (sessionStatus !== 'connected') {
         return res.status(503).json({ error: 'WhatsApp not connected', status: sessionStatus });
@@ -381,27 +352,12 @@ app.post('/send-bulk', authCheck, async (req, res) => {
             
             await logOutboundToPHP(item.phone, item.message, 'sent', item.invoice_id, item.customer_id, messageId, result);
             
-            results.push({
-                phone: item.phone,
-                success: true,
-                invoice_id: item.invoice_id || null,
-                message_id: messageId
-            });
-            
-            console.log(`[Bulk Send] Sent to ${item.phone}`);
-            
+            results.push({ phone: item.phone, success: true, message_id: messageId });
             await new Promise(resolve => setTimeout(resolve, 1000));
         } catch (err) {
-            console.error(`[Bulk Send] Failed to send to ${item.phone}:`, err.message);
-            
+            console.error(`[Bulk Send] Failed: ${item.phone}`, err.message);
             await logOutboundToPHP(item.phone, item.message, 'failed', item.invoice_id, item.customer_id, null, { error: err.message });
-            
-            results.push({
-                phone: item.phone,
-                success: false,
-                error: err.message,
-                invoice_id: item.invoice_id || null
-            });
+            results.push({ phone: item.phone, success: false, error: err.message });
         }
     }
     
@@ -424,10 +380,9 @@ app.post('/logout', authCheck, async (req, res) => {
     retryCount    = 0;
     messageQueue  = [];
     setTimeout(() => connectToWhatsApp(), 1000);
-    res.json({ success: true, message: 'Logged out. New QR will be generated.' });
+    res.json({ success: true, message: 'Logged out' });
 });
 
-// ─── Retry delay ───────────────────────────────────────────────────────────
 function getRetryDelay() {
     const delay = Math.min(1000 * Math.pow(2, retryCount), 30000);
     retryCount++;
@@ -444,21 +399,21 @@ async function connectToWhatsApp() {
     try {
         const { state, saveCreds }  = await useMultiFileAuthState(AUTH_DIR);
         const { version, isLatest } = await fetchLatestBaileysVersion();
-        console.log(`[WA] Using WA version ${version.join('.')} — isLatest: ${isLatest}`);
+        console.log(`[WA] Version ${version.join('.')}`);
 
         sock = makeWASocket({
             version,
             logger,
-            auth:                  state,
-            printQRInTerminal:     false,
-            browser:               Browsers.ubuntu('Chrome'),
-            connectTimeoutMs:      60_000,
-            defaultQueryTimeoutMs: 60_000,
-            keepAliveIntervalMs:   10_000,
-            retryRequestDelayMs:   2_000,
-            maxMsgRetryCount:      3,
-            syncFullHistory:       true,
-            markOnlineOnConnect:   false,
+            auth: state,
+            printQRInTerminal: false,
+            browser: Browsers.ubuntu('Chrome'),
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,
+            retryRequestDelayMs: 2000,
+            maxMsgRetryCount: 3,
+            syncFullHistory: true,
+            markOnlineOnConnect: false,
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -471,49 +426,44 @@ async function connectToWhatsApp() {
                 if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
                 if (!msg.message) continue;
 
-                // Save raw for debug
-                global._lastRawMsg = {
-                    type,
-                    key:      msg.key,
-                    pushName: msg.pushName,
-                    msgKeys:  Object.keys(msg.message),
-                    timestamp: msg.messageTimestamp,
-                };
-
-                // Format phone number - remove JID format and add country code
-                const formattedPhone = formatPhoneNumber(jid);
+                // Extract and format phone number
+                let phone = jid.replace('@s.whatsapp.net', '');
+                phone = phone.replace(/[^0-9]/g, '');
+                if (phone.length >= 10) {
+                    phone = '+' + phone;
+                }
+                
                 const fromMe = msg.key?.fromMe || false;
+                
+                console.log(`[WA] Message from: ${phone} (fromMe: ${fromMe})`);
 
-                console.log(`[WA] Message from: ${formattedPhone} (Original JID: ${jid})`);
+                storeMessage(phone, msg);
 
-                storeMessage(formattedPhone, msg);
-
-                // Only process live inbound for real-time logging
+                // Process inbound messages (not from me)
                 if (type === 'notify' && !fromMe) {
                     const body = extractBody(msg);
                     if (!body) continue;
 
-                    // Add to local queue
                     messageSeq++;
                     const queuedMsg = {
-                        seq:          messageSeq,
-                        baileys_id:   msg.key.id,
-                        phone: formattedPhone,
+                        seq: messageSeq,
+                        baileys_id: msg.key.id,
+                        phone: phone,
                         contact_name: msg.pushName || '',
-                        body,
-                        msg_type:     extractType(msg),
-                        timestamp:    msg.messageTimestamp,
+                        body: body,
+                        msg_type: extractType(msg),
+                        timestamp: msg.messageTimestamp,
                     };
                     messageQueue.push(queuedMsg);
-
+                    
                     if (messageQueue.length > 200) messageQueue = messageQueue.slice(-200);
-                    console.log(`[WA] Live inbound from ${formattedPhone}: ${body.substring(0, 60)}`);
+                    console.log(`[WA] Inbound from ${phone}: ${body.substring(0, 50)}`);
 
-                    // Send to PHP webhook with clean formatted phone number
+                    // Send to PHP webhook
                     const webhookData = {
                         message: {
                             id: msg.key.id,
-                            from: formattedPhone,  // Clean phone number like +521234567890
+                            from: phone,
                             text: body,
                             type: extractType(msg),
                             timestamp: msg.messageTimestamp,
@@ -522,25 +472,18 @@ async function connectToWhatsApp() {
                         }
                     };
                     
-                    // Fire and forget - don't await to avoid blocking
-                    sendToPHPWebhook(webhookData).catch(err => {
-                        console.error('[WA] Webhook error:', err.message);
-                    });
+                    await sendToPHPWebhook(webhookData);
                 }
                 
-                // Log outgoing messages sent from WhatsApp Web/App
+                // Log outgoing messages from WhatsApp Web
                 if (type === 'notify' && fromMe) {
                     const body = extractBody(msg);
                     if (body) {
-                        console.log(`[WA] Outbound message sent to ${formattedPhone}: ${body.substring(0, 60)}`);
-                        logOutboundToPHP(formattedPhone, body, 'sent', null, null, msg.key.id, { source: 'manual' }).catch(err => {
-                            console.error('[WA] Failed to log outbound message:', err.message);
-                        });
+                        console.log(`[WA] Outbound to ${phone}: ${body.substring(0, 50)}`);
+                        await logOutboundToPHP(phone, body, 'sent', null, null, msg.key.id, { source: 'manual' });
                     }
                 }
             }
-
-            console.log(`[WA] Store: ${totalStored} stored, ${totalSkipped} skipped`);
         });
 
         sock.ev.on('connection.update', async (update) => {
@@ -548,11 +491,11 @@ async function connectToWhatsApp() {
 
             if (qr) {
                 sessionStatus = 'scanning';
-                currentQR     = null;
-                retryCount    = 0;
+                currentQR = null;
+                retryCount = 0;
                 try {
                     currentQR = await qrcode.toDataURL(qr);
-                    console.log('[WA] QR generated — waiting for scan');
+                    console.log('[WA] QR generated');
                 } catch (e) {
                     console.error('[WA] QR error:', e.message);
                 }
@@ -560,35 +503,26 @@ async function connectToWhatsApp() {
 
             if (connection === 'open') {
                 sessionStatus = 'connected';
-                currentQR     = null;
-                isConnecting  = false;
-                retryCount    = 0;
-                console.log('[WA] Connected! Ready to receive and send messages.');
-                
-                const startupData = {
-                    event: 'startup',
-                    status: 'connected',
-                    timestamp: new Date().toISOString()
-                };
-                sendToPHPWebhook(startupData).catch(err => {
-                    console.error('[WA] Startup webhook error:', err.message);
-                });
+                currentQR = null;
+                isConnecting = false;
+                retryCount = 0;
+                console.log('[WA] Connected!');
             }
 
             if (connection === 'close') {
                 isConnecting = false;
-                const code   = lastDisconnect?.error?.output?.statusCode;
+                const code = lastDisconnect?.error?.output?.statusCode;
                 console.log('[WA] Disconnected, code:', code);
 
                 if (code === DisconnectReason.loggedOut) {
                     if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                     sessionStatus = 'disconnected';
-                    currentQR     = null;
-                    retryCount    = 0;
+                    currentQR = null;
+                    retryCount = 0;
                     setTimeout(() => connectToWhatsApp(), 3000);
                 } else {
                     sessionStatus = 'disconnected';
-                    const delay   = getRetryDelay();
+                    const delay = getRetryDelay();
                     console.log(`[WA] Reconnecting in ${delay / 1000}s...`);
                     setTimeout(() => connectToWhatsApp(), delay);
                 }
@@ -597,7 +531,7 @@ async function connectToWhatsApp() {
 
     } catch (err) {
         isConnecting = false;
-        const delay  = getRetryDelay();
+        const delay = getRetryDelay();
         console.error('[WA] Setup error:', err.message);
         setTimeout(() => connectToWhatsApp(), delay);
     }
@@ -606,13 +540,7 @@ async function connectToWhatsApp() {
 // ─── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`[Server] Running on port ${PORT}`);
-    console.log(`[Server] PHP Webhook URL: ${PHP_WEBHOOK_URL}`);
+    console.log(`[Server] Webhook URL: ${PHP_WEBHOOK_URL}`);
     console.log(`[Server] API Secret: ${API_SECRET.substring(0, 10)}...`);
-    console.log(`[Server] Phone number format: International format with country code (+521234567890)`);
-    console.log(`[Server] CORS enabled for: bodega.mircalderonmayoreo.com`);
-    console.log(`[Server] Test endpoints:`);
-    console.log(`  GET  /test-webhook - Test webhook connection`);
-    console.log(`  GET  /health       - Health check`);
-    console.log(`  GET  /status       - WhatsApp status`);
     connectToWhatsApp();
 });
