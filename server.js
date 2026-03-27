@@ -66,6 +66,39 @@ function extractType(msg) {
     return 'text';
 }
 
+// ─── Format phone number - Remove JID format, add country code ────────────
+function formatPhoneNumber(rawJid) {
+    // Remove @s.whatsapp.net if present
+    let phone = rawJid.replace('@s.whatsapp.net', '');
+    
+    // Remove any non-digit characters (except plus sign)
+    phone = phone.replace(/[^0-9+]/g, '');
+    
+    // If it already has a plus sign, keep it
+    if (phone.startsWith('+')) {
+        return phone;
+    }
+    
+    // If it's just digits (no plus sign)
+    // Remove any leading zeros
+    phone = phone.replace(/^0+/, '');
+    
+    // For Mexico: if phone is 10 digits, add +52
+    if (phone.length === 10) {
+        phone = '+52' + phone;
+    }
+    // For Mexico: if phone is 11 digits starting with 52, add +
+    else if (phone.length === 11 && phone.startsWith('52')) {
+        phone = '+' + phone;
+    }
+    // For other countries: just add plus sign
+    else if (phone.length >= 10) {
+        phone = '+' + phone;
+    }
+    
+    return phone;
+}
+
 function storeMessage(phone, msg) {
     const body = extractBody(msg);
 
@@ -156,7 +189,6 @@ const app = express();
 
 // ─── CORS Middleware ─────────────────────────────────────────────────────────
 app.use((req, res, next) => {
-    // Allow requests from your PHP domain
     const allowedOrigins = [
         'https://bodega.mircalderonmayoreo.com',
         'http://bodega.mircalderonmayoreo.com',
@@ -172,16 +204,10 @@ app.use((req, res, next) => {
         res.header('Access-Control-Allow-Origin', origin);
     }
     
-    // Allow credentials
     res.header('Access-Control-Allow-Credentials', true);
-    
-    // Allow specific methods
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    
-    // Allow specific headers
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, X-API-Secret');
     
-    // Handle preflight requests
     if (req.method === 'OPTIONS') {
         return res.sendStatus(200);
     }
@@ -296,6 +322,7 @@ app.post('/send', authCheck, async (req, res) => {
     }
     
     try {
+        // Format phone number - ensure it's in JID format for sending
         let jid = phone.toString().replace(/\D/g, '');
         if (!jid.endsWith('@s.whatsapp.net')) {
             jid = jid + '@s.whatsapp.net';
@@ -444,6 +471,7 @@ async function connectToWhatsApp() {
                 if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
                 if (!msg.message) continue;
 
+                // Save raw for debug
                 global._lastRawMsg = {
                     type,
                     key:      msg.key,
@@ -452,20 +480,25 @@ async function connectToWhatsApp() {
                     timestamp: msg.messageTimestamp,
                 };
 
-                const phone  = jid.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
+                // Format phone number - remove JID format and add country code
+                const formattedPhone = formatPhoneNumber(jid);
                 const fromMe = msg.key?.fromMe || false;
 
-                storeMessage(phone, msg);
+                console.log(`[WA] Message from: ${formattedPhone} (Original JID: ${jid})`);
 
+                storeMessage(formattedPhone, msg);
+
+                // Only process live inbound for real-time logging
                 if (type === 'notify' && !fromMe) {
                     const body = extractBody(msg);
                     if (!body) continue;
 
+                    // Add to local queue
                     messageSeq++;
                     const queuedMsg = {
                         seq:          messageSeq,
                         baileys_id:   msg.key.id,
-                        phone,
+                        phone: formattedPhone,
                         contact_name: msg.pushName || '',
                         body,
                         msg_type:     extractType(msg),
@@ -474,12 +507,13 @@ async function connectToWhatsApp() {
                     messageQueue.push(queuedMsg);
 
                     if (messageQueue.length > 200) messageQueue = messageQueue.slice(-200);
-                    console.log(`[WA] Live inbound from ${phone}: ${body.substring(0, 60)}`);
+                    console.log(`[WA] Live inbound from ${formattedPhone}: ${body.substring(0, 60)}`);
 
+                    // Send to PHP webhook with clean formatted phone number
                     const webhookData = {
                         message: {
                             id: msg.key.id,
-                            from: phone,
+                            from: formattedPhone,  // Clean phone number like +521234567890
                             text: body,
                             type: extractType(msg),
                             timestamp: msg.messageTimestamp,
@@ -488,16 +522,18 @@ async function connectToWhatsApp() {
                         }
                     };
                     
+                    // Fire and forget - don't await to avoid blocking
                     sendToPHPWebhook(webhookData).catch(err => {
                         console.error('[WA] Webhook error:', err.message);
                     });
                 }
                 
+                // Log outgoing messages sent from WhatsApp Web/App
                 if (type === 'notify' && fromMe) {
                     const body = extractBody(msg);
                     if (body) {
-                        console.log(`[WA] Outbound message sent to ${phone}: ${body.substring(0, 60)}`);
-                        logOutboundToPHP(phone, body, 'sent', null, null, msg.key.id, { source: 'manual' }).catch(err => {
+                        console.log(`[WA] Outbound message sent to ${formattedPhone}: ${body.substring(0, 60)}`);
+                        logOutboundToPHP(formattedPhone, body, 'sent', null, null, msg.key.id, { source: 'manual' }).catch(err => {
                             console.error('[WA] Failed to log outbound message:', err.message);
                         });
                     }
@@ -572,6 +608,7 @@ app.listen(PORT, () => {
     console.log(`[Server] Running on port ${PORT}`);
     console.log(`[Server] PHP Webhook URL: ${PHP_WEBHOOK_URL}`);
     console.log(`[Server] API Secret: ${API_SECRET.substring(0, 10)}...`);
+    console.log(`[Server] Phone number format: International format with country code (+521234567890)`);
     console.log(`[Server] CORS enabled for: bodega.mircalderonmayoreo.com`);
     console.log(`[Server] Test endpoints:`);
     console.log(`  GET  /test-webhook - Test webhook connection`);
