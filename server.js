@@ -153,6 +153,42 @@ const logger = pino({ level: 'silent' });
 
 // ─── Express ───────────────────────────────────────────────────────────────
 const app = express();
+
+// ─── CORS Middleware ─────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    // Allow requests from your PHP domain
+    const allowedOrigins = [
+        'https://bodega.mircalderonmayoreo.com',
+        'http://bodega.mircalderonmayoreo.com',
+        'https://www.bodega.mircalderonmayoreo.com',
+        'http://localhost:3000',
+        'http://localhost:80',
+        'http://localhost'
+    ];
+    
+    const origin = req.headers.origin;
+    
+    if (allowedOrigins.includes(origin)) {
+        res.header('Access-Control-Allow-Origin', origin);
+    }
+    
+    // Allow credentials
+    res.header('Access-Control-Allow-Credentials', true);
+    
+    // Allow specific methods
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    
+    // Allow specific headers
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, X-API-Secret');
+    
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    
+    next();
+});
+
 app.use(express.json());
 
 function authCheck(req, res, next) {
@@ -247,7 +283,7 @@ app.post('/test-webhook', authCheck, (req, res) => {
     });
 });
 
-// ─── Send message endpoint (used by PHP cron for invoices) ────────────────
+// ─── Send message endpoint ────────────────────────────────────────────────
 app.post('/send', authCheck, async (req, res) => {
     if (sessionStatus !== 'connected') {
         return res.status(503).json({ error: 'WhatsApp not connected', status: sessionStatus });
@@ -292,7 +328,7 @@ app.post('/send', authCheck, async (req, res) => {
     }
 });
 
-// ─── Bulk send endpoint for multiple invoices ────────────────────────────
+// ─── Bulk send endpoint ────────────────────────────────────────────────────
 app.post('/send-bulk', authCheck, async (req, res) => {
     if (sessionStatus !== 'connected') {
         return res.status(503).json({ error: 'WhatsApp not connected', status: sessionStatus });
@@ -536,6 +572,7 @@ app.listen(PORT, () => {
     console.log(`[Server] Running on port ${PORT}`);
     console.log(`[Server] PHP Webhook URL: ${PHP_WEBHOOK_URL}`);
     console.log(`[Server] API Secret: ${API_SECRET.substring(0, 10)}...`);
+    console.log(`[Server] CORS enabled for: bodega.mircalderonmayoreo.com`);
     console.log(`[Server] Test endpoints:`);
     console.log(`  GET  /test-webhook - Test webhook connection`);
     console.log(`  GET  /health       - Health check`);
