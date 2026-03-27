@@ -66,22 +66,35 @@ function extractType(msg) {
     return 'text';
 }
 
-// Simple phone formatter that just removes @s.whatsapp.net and adds +
+// Replace the formatPhoneNumber function in server.js with this improved version
 function formatPhoneNumber(rawJid) {
     try {
         // Remove @s.whatsapp.net if present
         let phone = rawJid.replace('@s.whatsapp.net', '');
         
         // Remove any non-digit characters
-        phone = phone.replace(/[^0-9]/g, '');
+        let digits = phone.replace(/[^0-9]/g, '');
         
-        // If it's a valid number, add + prefix
-        if (phone.length >= 10) {
-            return '+' + phone;
+        // WhatsApp numbers can be in various formats:
+        // - 521234567890 (Mexico with country code)
+        // - 1234567890 (without country code)
+        // - 521234567890@s.whatsapp.net (full JID)
+        
+        // If the number is 10 digits (Mexico local), add +52
+        if (digits.length === 10) {
+            digits = '52' + digits;
         }
         
-        // Return as is if can't format
-        return phone;
+        // If the number is 11 digits starting with 52, that's Mexico format
+        // If it's 12 digits or more, it might have extra digits - trim to reasonable length
+        if (digits.length > 13) {
+            // WhatsApp numbers are typically max 13 digits with country code
+            // Try to extract the last 10-13 digits
+            digits = digits.slice(-13);
+        }
+        
+        // Add plus sign
+        return '+' + digits;
     } catch (error) {
         console.error('[WA] Phone formatting error:', error);
         return rawJid;
