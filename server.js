@@ -12,7 +12,7 @@ import pino    from 'pino';
 import fs      from 'fs';
 import path    from 'path';
 import { fileURLToPath } from 'url';
-import axios from 'axios'; // Added for webhook calls
+import axios from 'axios';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,7 +42,6 @@ function extractBody(msg) {
     const m = msg.message;
     if (!m) return null;
 
-    // Unwrap ephemeral/view-once wrappers
     const inner = m.ephemeralMessage?.message
                || m.viewOnceMessage?.message
                || m.viewOnceMessageV2?.message
@@ -89,7 +88,6 @@ function storeMessage(phone, msg) {
 
     totalStored++;
 
-    // Cap per contact
     if (historyStore[phone].length > 1000) {
         historyStore[phone] = historyStore[phone].slice(-1000);
     }
@@ -199,7 +197,6 @@ app.post('/messages/ack', authCheck, (req, res) => {
     res.json({ removed: before - messageQueue.length, remaining: messageQueue.length });
 });
 
-// Debug endpoint — shows raw structure of last message received
 app.get('/debug/last', authCheck, (req, res) => {
     res.json({ last_raw: global._lastRawMsg || null });
 });
@@ -225,7 +222,32 @@ app.get('/sync', authCheck, (req, res) => {
     res.json({ total, offset, limit, has_more: hasMore, messages: sliced });
 });
 
-// Send message endpoint (used by PHP cron for invoices) - UPDATED with logging
+// ─── Test Webhook Endpoint ────────────────────────────────────────────────
+app.get('/test-webhook', authCheck, (req, res) => {
+    res.json({ 
+        success: true, 
+        message: 'Webhook test successful',
+        status: sessionStatus,
+        timestamp: new Date().toISOString(),
+        endpoints: {
+            health: '/health',
+            status: '/status',
+            webhook: PHP_WEBHOOK_URL
+        }
+    });
+});
+
+app.post('/test-webhook', authCheck, (req, res) => {
+    res.json({ 
+        success: true, 
+        message: 'Webhook POST test successful',
+        received: req.body,
+        status: sessionStatus,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ─── Send message endpoint (used by PHP cron for invoices) ────────────────
 app.post('/send', authCheck, async (req, res) => {
     if (sessionStatus !== 'connected') {
         return res.status(503).json({ error: 'WhatsApp not connected', status: sessionStatus });
@@ -238,19 +260,16 @@ app.post('/send', authCheck, async (req, res) => {
     }
     
     try {
-        // Format phone number - remove any non-digits and add @s.whatsapp.net
         let jid = phone.toString().replace(/\D/g, '');
         if (!jid.endsWith('@s.whatsapp.net')) {
             jid = jid + '@s.whatsapp.net';
         }
         
-        // Send message via Baileys
         const result = await sock.sendMessage(jid, { text: message });
         const messageId = result.key?.id;
         
         console.log(`[Send] Message sent to ${phone}${invoice_id ? ` (Invoice: ${invoice_id})` : ''}`);
         
-        // Log to PHP webhook (fire and forget)
         logOutboundToPHP(phone, message, 'sent', invoice_id, customer_id, messageId, result).catch(err => {
             console.error('[Send] Failed to log to webhook:', err.message);
         });
@@ -265,7 +284,6 @@ app.post('/send', authCheck, async (req, res) => {
     } catch (err) {
         console.error('[Send] Error:', err.message);
         
-        // Log failed message
         logOutboundToPHP(phone, message, 'failed', invoice_id, customer_id, null, { error: err.message }).catch(err => {
             console.error('[Send] Failed to log error to webhook:', err.message);
         });
@@ -274,7 +292,7 @@ app.post('/send', authCheck, async (req, res) => {
     }
 });
 
-// Bulk send endpoint for multiple invoices - UPDATED with logging
+// ─── Bulk send endpoint for multiple invoices ────────────────────────────
 app.post('/send-bulk', authCheck, async (req, res) => {
     if (sessionStatus !== 'connected') {
         return res.status(503).json({ error: 'WhatsApp not connected', status: sessionStatus });
@@ -298,7 +316,6 @@ app.post('/send-bulk', authCheck, async (req, res) => {
             const result = await sock.sendMessage(jid, { text: item.message });
             const messageId = result.key?.id;
             
-            // Log to PHP webhook
             await logOutboundToPHP(item.phone, item.message, 'sent', item.invoice_id, item.customer_id, messageId, result);
             
             results.push({
@@ -310,12 +327,10 @@ app.post('/send-bulk', authCheck, async (req, res) => {
             
             console.log(`[Bulk Send] Sent to ${item.phone}`);
             
-            // Small delay to avoid rate limiting
             await new Promise(resolve => setTimeout(resolve, 1000));
         } catch (err) {
             console.error(`[Bulk Send] Failed to send to ${item.phone}:`, err.message);
             
-            // Log failed message
             await logOutboundToPHP(item.phone, item.message, 'failed', item.invoice_id, item.customer_id, null, { error: err.message });
             
             results.push({
@@ -334,37 +349,6 @@ app.post('/send-bulk', authCheck, async (req, res) => {
         failed: results.filter(r => !r.success).length,
         results 
     });
-});
-
-// New endpoint to test webhook connection
-app.get('/test-webhook', authCheck, async (req, res) => {
-    try {
-        const testData = {
-            test: true,
-            message: 'Webhook test from Node.js',
-            timestamp: new Date().toISOString()
-        };
-        
-        const response = await axios.post(PHP_WEBHOOK_URL, testData, {
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Secret': API_SECRET
-            },
-            timeout: 5000
-        });
-        
-        res.json({ 
-            success: true, 
-            message: 'Webhook test successful',
-            response: response.data 
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message,
-            details: error.response?.data 
-        });
-    }
 });
 
 app.post('/logout', authCheck, async (req, res) => {
@@ -424,7 +408,6 @@ async function connectToWhatsApp() {
                 if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
                 if (!msg.message) continue;
 
-                // Save raw for debug
                 global._lastRawMsg = {
                     type,
                     key:      msg.key,
@@ -438,12 +421,10 @@ async function connectToWhatsApp() {
 
                 storeMessage(phone, msg);
 
-                // Process inbound messages (not from me)
                 if (type === 'notify' && !fromMe) {
                     const body = extractBody(msg);
                     if (!body) continue;
 
-                    // Add to local queue
                     messageSeq++;
                     const queuedMsg = {
                         seq:          messageSeq,
@@ -459,7 +440,6 @@ async function connectToWhatsApp() {
                     if (messageQueue.length > 200) messageQueue = messageQueue.slice(-200);
                     console.log(`[WA] Live inbound from ${phone}: ${body.substring(0, 60)}`);
 
-                    // Send to PHP webhook for database storage
                     const webhookData = {
                         message: {
                             id: msg.key.id,
@@ -472,19 +452,15 @@ async function connectToWhatsApp() {
                         }
                     };
                     
-                    // Fire and forget - don't await to avoid blocking
                     sendToPHPWebhook(webhookData).catch(err => {
                         console.error('[WA] Webhook error:', err.message);
                     });
                 }
                 
-                // Also log outgoing messages that are sent from this session (for completeness)
                 if (type === 'notify' && fromMe) {
                     const body = extractBody(msg);
                     if (body) {
                         console.log(`[WA] Outbound message sent to ${phone}: ${body.substring(0, 60)}`);
-                        // Optionally log outgoing messages that were sent from WhatsApp Web/App
-                        // This ensures all messages are captured
                         logOutboundToPHP(phone, body, 'sent', null, null, msg.key.id, { source: 'manual' }).catch(err => {
                             console.error('[WA] Failed to log outbound message:', err.message);
                         });
@@ -517,7 +493,6 @@ async function connectToWhatsApp() {
                 retryCount    = 0;
                 console.log('[WA] Connected! Ready to receive and send messages.');
                 
-                // Send a startup notification to PHP webhook
                 const startupData = {
                     event: 'startup',
                     status: 'connected',
@@ -561,6 +536,9 @@ app.listen(PORT, () => {
     console.log(`[Server] Running on port ${PORT}`);
     console.log(`[Server] PHP Webhook URL: ${PHP_WEBHOOK_URL}`);
     console.log(`[Server] API Secret: ${API_SECRET.substring(0, 10)}...`);
-    console.log(`[Server] Test webhook with: curl -H "X-API-Secret: ${API_SECRET}" ${process.env.RAILWAY_PUBLIC_DOMAIN || 'http://localhost:' + PORT}/test-webhook`);
+    console.log(`[Server] Test endpoints:`);
+    console.log(`  GET  /test-webhook - Test webhook connection`);
+    console.log(`  GET  /health       - Health check`);
+    console.log(`  GET  /status       - WhatsApp status`);
     connectToWhatsApp();
 });
