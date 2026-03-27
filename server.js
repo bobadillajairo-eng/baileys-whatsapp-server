@@ -1,4 +1,4 @@
-// server.js — Complete WhatsApp Service with Railway MySQL Database
+// server.js — Enhanced Baileys WhatsApp microservice with CRM integration
 import makeWASocket, {
     DisconnectReason,
     useMultiFileAuthState,
@@ -23,19 +23,16 @@ const PORT       = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || 'mircalderon_wa_2026_xk9q';
 const AUTH_DIR   = path.join(__dirname, 'auth_state');
 
-// Database configuration - Use Railway MySQL variables
+// Database configuration (add these to Railway environment variables)
 const DB_CONFIG = {
-    host: process.env.MYSQL_HOST || process.env.DB_HOST || 'db5019972151.hosting-data.io',
-    user: process.env.MYSQL_USER || process.env.DB_USER || 'dbu165976',
-    password: process.env.MYSQL_PASSWORD || process.env.DB_PASSWORD || 'J0528B1994?',
-    database: process.env.MYSQL_DATABASE || process.env.DB_NAME || 'dbs1541526',
-    port: parseInt(process.env.MYSQL_PORT || process.env.DB_PORT || '3306'),
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'crm_db',
     waitForConnections: true,
     connectionLimit: 10,
     enableKeepAlive: true,
-    keepAliveInitialDelay: 0,
-    connectTimeout: 30000,
-    acquireTimeout: 30000
+    keepAliveInitialDelay: 0
 };
 
 // ─── State ─────────────────────────────────────────────────────────────────
@@ -46,67 +43,31 @@ let isConnecting  = false;
 let retryCount    = 0;
 let db            = null;
 let io            = null;
-let syncInProgress = false;
 
 // ─── Logger ────────────────────────────────────────────────────────────────
 const logger = pino({ level: 'silent' });
 
-// ─── Express & Socket.io Setup ─────────────────────────────────────────────
-const app = express();
-const server = http.createServer(app);
-io = new Server(server, {
-    cors: {
-        origin: process.env.CORS_ORIGIN || '*',
-        methods: ["GET", "POST"]
-    }
-});
-
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// ─── Authentication Middleware ────────────────────────────────────────────
-function authCheck(req, res, next) {
-    const token = req.headers['x-api-secret'] || req.query.api_secret;
-    if (token !== API_SECRET) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-    next();
-}
-
-// ─── Database Functions ───────────────────────────────────────────────────
+// ─── Database Initialization ───────────────────────────────────────────────
 async function initDatabase() {
-    let retries = 5;
-    while (retries > 0) {
-        try {
-            console.log(`[DB] Attempting to connect to Railway MySQL...`);
-            console.log(`[DB] Host: ${DB_CONFIG.host}`);
-            console.log(`[DB] Database: ${DB_CONFIG.database}`);
-            
-            db = await mysql.createPool(DB_CONFIG);
-            
-            // Test connection
-            const [result] = await db.query('SELECT 1 as connected, NOW() as server_time');
-            console.log(`[DB] ✓ Connected to MySQL at ${result[0].server_time}`);
-            
-            await ensureTablesExist();
-            return true;
-            
-        } catch (err) {
-            console.error(`[DB] Connection error: ${err.message}`);
-            retries--;
-            if (retries === 0) {
-                console.error('[DB] Failed to connect after multiple attempts');
-                return false;
-            }
-            console.log(`[DB] Retrying in 5 seconds... (${retries} attempts left)`);
-            await new Promise(resolve => setTimeout(resolve, 5000));
-        }
+    try {
+        db = await mysql.createPool(DB_CONFIG);
+        
+        // Test connection
+        await db.query('SELECT 1');
+        console.log('[DB] Connected to MySQL');
+        
+        // Ensure tables exist
+        await ensureTablesExist();
+        
+        return true;
+    } catch (err) {
+        console.error('[DB] Connection error:', err.message);
+        return false;
     }
-    return false;
 }
 
 async function ensureTablesExist() {
-    // WhatsApp Contacts table
+    // WhatsApp Contacts
     await db.query(`
         CREATE TABLE IF NOT EXISTS whatsapp_contacts (
             id INT PRIMARY KEY AUTO_INCREMENT,
@@ -121,14 +82,12 @@ async function ensureTablesExist() {
             INDEX idx_customer (customer_id)
         )
     `);
-    console.log('[DB] Table "whatsapp_contacts" verified');
     
-    // WhatsApp Messages table with message_id for deduplication
+    // WhatsApp Messages
     await db.query(`
         CREATE TABLE IF NOT EXISTS whatsapp_messages (
             id INT PRIMARY KEY AUTO_INCREMENT,
             contact_id INT NOT NULL,
-            message_id VARCHAR(100) UNIQUE,
             message TEXT,
             direction ENUM('incoming', 'outgoing') NOT NULL,
             is_read BOOLEAN DEFAULT FALSE,
@@ -136,13 +95,11 @@ async function ensureTablesExist() {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (contact_id) REFERENCES whatsapp_contacts(id) ON DELETE CASCADE,
             INDEX idx_contact (contact_id),
-            INDEX idx_created (created_at),
-            INDEX idx_message_id (message_id)
+            INDEX idx_created (created_at)
         )
     `);
-    console.log('[DB] Table "whatsapp_messages" verified');
     
-    // WhatsApp Conversations table
+    // WhatsApp Conversations (for staff assignment)
     await db.query(`
         CREATE TABLE IF NOT EXISTS whatsapp_conversations (
             id INT PRIMARY KEY AUTO_INCREMENT,
@@ -151,14 +108,13 @@ async function ensureTablesExist() {
             status ENUM('new', 'auto_replied', 'active', 'resolved') DEFAULT 'new',
             started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             resolved_at DATETIME,
-            FOREIGN KEY (contact_id) REFERENCES whatsapp_contacts(id) ON DELETE CASCADE,
+            FOREIGN KEY (contact_id) REFERENCES whatsapp_contacts(id),
             INDEX idx_status (status),
             INDEX idx_assigned (assigned_to)
         )
     `);
-    console.log('[DB] Table "whatsapp_conversations" verified');
     
-    // Auto-reply Rules table
+    // Auto-reply Rules
     await db.query(`
         CREATE TABLE IF NOT EXISTS whatsapp_auto_reply_rules (
             id INT PRIMARY KEY AUTO_INCREMENT,
@@ -170,22 +126,6 @@ async function ensureTablesExist() {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
-    console.log('[DB] Table "whatsapp_auto_reply_rules" verified');
-    
-    // Sync Log table
-    await db.query(`
-        CREATE TABLE IF NOT EXISTS whatsapp_sync_log (
-            id INT PRIMARY KEY AUTO_INCREMENT,
-            sync_type VARCHAR(50),
-            last_sync_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            messages_synced INT DEFAULT 0,
-            contacts_synced INT DEFAULT 0,
-            status VARCHAR(20) DEFAULT 'completed',
-            error_message TEXT,
-            INDEX idx_sync_type (sync_type)
-        )
-    `);
-    console.log('[DB] Table "whatsapp_sync_log" verified');
     
     // Insert default auto-reply rules if none exist
     const [rules] = await db.query('SELECT COUNT(*) as count FROM whatsapp_auto_reply_rules');
@@ -200,18 +140,42 @@ async function ensureTablesExist() {
         console.log('[DB] Default auto-reply rules inserted');
     }
     
-    console.log('[DB] All tables verified');
+    console.log('[DB] Tables verified');
 }
 
+// ─── Express & Socket.io Setup ─────────────────────────────────────────────
+const app = express();
+const server = http.createServer(app);
+io = new Server(server, {
+    cors: {
+        origin: process.env.CORS_ORIGIN || '*',
+        methods: ["GET", "POST"]
+    }
+});
+
+app.use(express.json());
+
+// ─── Authentication Middleware ────────────────────────────────────────────
+function authCheck(req, res, next) {
+    const token = req.headers['x-api-secret'] || req.query.api_secret;
+    if (token !== API_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+}
+
+// ─── Helper Functions ──────────────────────────────────────────────────────
 async function getOrCreateContact(phoneNumber, name = null) {
     const cleanPhone = phoneNumber.replace(/\D/g, '');
     
+    // Check if contact exists
     const [contacts] = await db.query(
         'SELECT * FROM whatsapp_contacts WHERE phone_number = ?',
         [cleanPhone]
     );
     
     if (contacts.length > 0) {
+        // Update last_seen
         await db.query(
             'UPDATE whatsapp_contacts SET last_seen = NOW() WHERE id = ?',
             [contacts[0].id]
@@ -219,208 +183,166 @@ async function getOrCreateContact(phoneNumber, name = null) {
         return contacts[0];
     }
     
+    // Create new contact
     const [result] = await db.query(
         'INSERT INTO whatsapp_contacts (phone_number, name, created_at) VALUES (?, ?, NOW())',
         [cleanPhone, name || cleanPhone]
     );
     
-    const [newContact] = await db.query(
-        'SELECT * FROM whatsapp_contacts WHERE id = ?',
-        [result.insertId]
-    );
+    const newContact = {
+        id: result.insertId,
+        phone_number: cleanPhone,
+        name: name || cleanPhone
+    };
     
-    return newContact[0];
+    // Auto-link to existing customer if phone matches
+    await autoLinkToCustomer(newContact.id, cleanPhone);
+    
+    // Emit new contact event
+    io.emit('new_contact', newContact);
+    
+    return newContact;
 }
 
-async function saveMessageToDB(contactId, messageId, message, direction, rawMessage = null, timestamp = null) {
-    if (!messageId) return null;
-    
-    // Check if message already exists (deduplication)
-    const [existing] = await db.query(
-        'SELECT id FROM whatsapp_messages WHERE message_id = ?',
-        [messageId]
-    );
-    if (existing.length > 0) {
-        return existing[0].id;
+async function autoLinkToCustomer(contactId, phoneNumber) {
+    try {
+        // Try to find customer with this phone number
+        // Adjust table/column names based on your existing CRM structure
+        const [customers] = await db.query(`
+            SELECT id FROM your_customers_table 
+            WHERE phone = ? OR mobile = ? OR whatsapp = ?
+            LIMIT 1
+        `, [phoneNumber, phoneNumber, phoneNumber]);
+        
+        if (customers.length > 0) {
+            await db.query(
+                'UPDATE whatsapp_contacts SET customer_id = ? WHERE id = ?',
+                [customers[0].id, contactId]
+            );
+            console.log(`[CRM] Auto-linked contact ${phoneNumber} to customer ${customers[0].id}`);
+        }
+    } catch (err) {
+        console.error('[CRM] Auto-link error:', err.message);
     }
-    
+}
+
+async function saveMessage(contactId, message, direction, rawMessage = null) {
     const [result] = await db.query(
-        `INSERT INTO whatsapp_messages (contact_id, message_id, message, direction, raw_data, created_at) 
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [contactId, messageId, message, direction, rawMessage ? JSON.stringify(rawMessage) : null, timestamp || new Date()]
+        `INSERT INTO whatsapp_messages (contact_id, message, direction, raw_data, created_at) 
+         VALUES (?, ?, ?, ?, NOW())`,
+        [contactId, message, direction, rawMessage ? JSON.stringify(rawMessage) : null]
     );
     
-    // Update contact's last message
+    // Update last message in contact
     await db.query(
         `UPDATE whatsapp_contacts 
-         SET last_message = ?, last_message_at = ? 
+         SET last_message = ?, last_message_at = NOW() 
          WHERE id = ?`,
-        [message, timestamp || new Date(), contactId]
+        [message, contactId]
     );
     
     return result.insertId;
 }
 
-// ─── Message History Sync Functions ───────────────────────────────────────
-async function syncContactMessages(phoneNumber, limit = 100) {
-    if (!sock || sessionStatus !== 'connected') {
-        return { success: false, error: 'WhatsApp not connected' };
-    }
-    
+async function checkAndProcessAutoReply(contactId, phoneNumber, message) {
     try {
-        const jid = phoneNumber.replace(/\D/g, '') + '@s.whatsapp.net';
+        // Check if there's an active conversation assigned to human
+        const [activeConv] = await db.query(
+            `SELECT * FROM whatsapp_conversations 
+             WHERE contact_id = ? AND status = 'active' AND assigned_to IS NOT NULL`,
+            [contactId]
+        );
         
-        // Fetch messages from WhatsApp
-        const messages = await sock.loadMessages(jid, limit);
-        
-        if (!messages || messages.length === 0) {
-            return { success: true, messages_synced: 0, total_messages: 0 };
+        if (activeConv.length > 0) {
+            return null; // Human is handling, don't auto-reply
         }
         
-        // Get or create contact
-        const contact = await getOrCreateContact(phoneNumber);
-        let savedCount = 0;
+        // Check offline hours
+        const currentHour = new Date().getHours();
+        const isOffline = currentHour < 9 || currentHour > 18;
         
-        // Process messages in chronological order
-        for (const msg of messages.reverse()) {
-            // Extract message text
-            let messageText = msg.message?.conversation || 
-                             msg.message?.extendedTextMessage?.text || 
-                             msg.message?.imageMessage?.caption || '';
-            
-            if (!messageText && msg.message?.imageMessage) {
-                messageText = '📷 Image';
-            } else if (!messageText && msg.message?.videoMessage) {
-                messageText = '🎥 Video';
-            } else if (!messageText && msg.message?.audioMessage) {
-                messageText = '🎵 Audio';
-            } else if (!messageText && msg.message?.documentMessage) {
-                messageText = '📄 Document';
-            } else if (!messageText && msg.message?.stickerMessage) {
-                messageText = '🎨 Sticker';
+        // Get auto-reply rules
+        const [rules] = await db.query(
+            `SELECT * FROM whatsapp_auto_reply_rules 
+             WHERE is_active = 1 
+             ORDER BY priority ASC`
+        );
+        
+        let replyMessage = null;
+        let ruleType = null;
+        
+        for (const rule of rules) {
+            if (rule.trigger_type === 'offline' && isOffline) {
+                replyMessage = rule.reply_message;
+                ruleType = 'offline';
+                break;
             }
             
-            if (!messageText) continue;
+            if (rule.trigger_type === 'greeting') {
+                // Check if first message
+                const [msgCount] = await db.query(
+                    `SELECT COUNT(*) as count FROM whatsapp_messages 
+                     WHERE contact_id = ? AND direction = 'outgoing'`,
+                    [contactId]
+                );
+                
+                if (msgCount[0].count === 0) {
+                    replyMessage = rule.reply_message;
+                    ruleType = 'greeting';
+                    break;
+                }
+            }
             
-            const direction = msg.key.fromMe ? 'outgoing' : 'incoming';
-            const messageId = msg.key.id;
-            const timestamp = msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date();
-            
-            const saved = await saveMessageToDB(contact.id, messageId, messageText, direction, msg, timestamp);
-            if (saved) savedCount++;
+            if (rule.trigger_type === 'keyword' && rule.trigger_value) {
+                const keywords = rule.trigger_value.split(',');
+                if (keywords.some(kw => message.toLowerCase().includes(kw.toLowerCase()))) {
+                    replyMessage = rule.reply_message;
+                    ruleType = 'keyword';
+                    break;
+                }
+            }
         }
         
-        return { 
-            success: true, 
-            messages_synced: savedCount, 
-            total_messages: messages.length 
-        };
+        if (replyMessage && sock && sessionStatus === 'connected') {
+            // Send auto-reply
+            const jid = phoneNumber + '@s.whatsapp.net';
+            await sock.sendMessage(jid, { text: replyMessage });
+            
+            // Save outgoing auto-reply
+            await saveMessage(contactId, replyMessage, 'outgoing');
+            
+            // Create conversation record if not exists
+            const [conv] = await db.query(
+                `SELECT id FROM whatsapp_conversations WHERE contact_id = ?`,
+                [contactId]
+            );
+            
+            if (conv.length === 0) {
+                await db.query(
+                    `INSERT INTO whatsapp_conversations (contact_id, status, started_at) 
+                     VALUES (?, 'auto_replied', NOW())`,
+                    [contactId]
+                );
+            }
+            
+            console.log(`[AutoReply] Sent ${ruleType} reply to ${phoneNumber}`);
+            return replyMessage;
+        }
         
-    } catch (error) {
-        console.error(`Error syncing ${phoneNumber}:`, error.message);
-        return { success: false, error: error.message };
+        return null;
+    } catch (err) {
+        console.error('[AutoReply] Error:', err.message);
+        return null;
     }
 }
 
-async function syncAllContacts(limitPerContact = 100) {
-    if (syncInProgress) {
-        return { success: false, error: 'Sync already in progress' };
-    }
-    
-    syncInProgress = true;
-    console.log('[Sync] Starting full sync for all contacts...');
-    
-    try {
-        const [contacts] = await db.query('SELECT id, phone_number, name FROM whatsapp_contacts');
-        let totalSynced = 0;
-        let syncedContacts = 0;
-        
-        for (const contact of contacts) {
-            console.log(`[Sync] Syncing ${contact.phone_number}...`);
-            const result = await syncContactMessages(contact.phone_number, limitPerContact);
-            
-            if (result.success && result.messages_synced > 0) {
-                totalSynced += result.messages_synced;
-                syncedContacts++;
-                console.log(`[Sync]   ✓ Synced ${result.messages_synced} messages`);
-            } else if (!result.success) {
-                console.log(`[Sync]   ✗ Failed: ${result.error}`);
-            }
-            
-            // Rate limiting to avoid being blocked
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-        
-        // Log sync completion
-        await db.query(
-            `INSERT INTO whatsapp_sync_log (sync_type, messages_synced, contacts_synced, status) 
-             VALUES ('full_history', ?, ?, 'completed')`,
-            [totalSynced, syncedContacts]
-        );
-        
-        console.log(`[Sync] Full sync completed! Synced ${totalSynced} messages from ${syncedContacts} contacts`);
-        
-        return { success: true, totalSynced, syncedContacts };
-        
-    } catch (error) {
-        console.error('[Sync] Error during sync:', error);
-        await db.query(
-            `INSERT INTO whatsapp_sync_log (sync_type, messages_synced, contacts_synced, status, error_message) 
-             VALUES ('full_history', 0, 0, 'failed', ?)`,
-            [error.message]
-        );
-        return { success: false, error: error.message };
-    } finally {
-        syncInProgress = false;
-    }
-}
-
-async function syncRecentContacts(limit = 30) {
-    if (!sock || sessionStatus !== 'connected') {
-        return { success: false, error: 'WhatsApp not connected' };
-    }
-    
-    try {
-        const [contacts] = await db.query(
-            'SELECT id, phone_number FROM whatsapp_contacts ORDER BY last_message_at DESC LIMIT ?',
-            [limit]
-        );
-        
-        let totalSynced = 0;
-        
-        for (const contact of contacts) {
-            const result = await syncContactMessages(contact.phone_number, 50);
-            if (result.success) {
-                totalSynced += result.messages_synced;
-            }
-            await new Promise(resolve => setTimeout(resolve, 300));
-        }
-        
-        await db.query(
-            `INSERT INTO whatsapp_sync_log (sync_type, messages_synced, contacts_synced, status) 
-             VALUES ('recent', ?, ?, 'completed')`,
-            [totalSynced, contacts.length]
-        );
-        
-        return { success: true, totalSynced, contactsSynced: contacts.length };
-        
-    } catch (error) {
-        return { success: false, error: error.message };
-    }
-}
-
-// ─── API Routes ────────────────────────────────────────────────────────────
+// ─── Routes ────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
-        whatsapp: sessionStatus, 
-        database: db ? 'connected' : 'disconnected',
-        syncing: syncInProgress
+        whatsapp: sessionStatus,
+        database: db ? 'connected' : 'disconnected'
     });
-});
-
-app.get('/status', authCheck, (req, res) => {
-    res.json({ status: sessionStatus });
 });
 
 app.get('/qr', authCheck, (req, res) => {
@@ -429,88 +351,62 @@ app.get('/qr', authCheck, (req, res) => {
     res.json({ status: 'scanning', qr: currentQR });
 });
 
-// Sync a single contact
-app.post('/api/sync/contact', authCheck, async (req, res) => {
+app.get('/status', authCheck, (req, res) => {
+    res.json({ status: sessionStatus });
+});
+
+// Send message
+app.post('/send', authCheck, async (req, res) => {
     if (sessionStatus !== 'connected') {
-        return res.status(503).json({ error: 'WhatsApp not connected' });
+        return res.status(503).json({ error: 'WhatsApp not connected', status: sessionStatus });
     }
     
-    const { phone, contact_id, limit = 100 } = req.body;
-    let phoneNumber = phone;
+    const { phone, message, contact_id } = req.body;
+    if ((!phone && !contact_id) || !message) {
+        return res.status(400).json({ error: 'phone or contact_id, and message are required' });
+    }
     
-    if (contact_id && !phone) {
-        const [contacts] = await db.query(
-            'SELECT phone_number FROM whatsapp_contacts WHERE id = ?',
-            [contact_id]
-        );
-        if (contacts.length === 0) {
-            return res.status(404).json({ error: 'Contact not found' });
+    try {
+        let phoneNumber = phone;
+        
+        // If contact_id provided, get phone number from database
+        if (contact_id && !phone) {
+            const [contacts] = await db.query(
+                'SELECT phone_number FROM whatsapp_contacts WHERE id = ?',
+                [contact_id]
+            );
+            if (contacts.length === 0) {
+                return res.status(404).json({ error: 'Contact not found' });
+            }
+            phoneNumber = contacts[0].phone_number;
         }
-        phoneNumber = contacts[0].phone_number;
+        
+        const cleanPhone = phoneNumber.replace(/\D/g, '');
+        const jid = cleanPhone + '@s.whatsapp.net';
+        
+        await sock.sendMessage(jid, { text: message });
+        
+        // Get or create contact and save message
+        const contact = await getOrCreateContact(cleanPhone);
+        await saveMessage(contact.id, message, 'outgoing');
+        
+        // Emit real-time update
+        io.emit('message_sent', {
+            contact_id: contact.id,
+            phone_number: cleanPhone,
+            message: message,
+            direction: 'outgoing',
+            timestamp: new Date()
+        });
+        
+        res.json({ success: true, to: jid, contact_id: contact.id });
+    } catch (err) {
+        console.error('Send error:', err.message);
+        res.status(500).json({ error: err.message });
     }
-    
-    if (!phoneNumber) {
-        return res.status(400).json({ error: 'Phone number required' });
-    }
-    
-    const result = await syncContactMessages(phoneNumber, limit);
-    res.json(result);
 });
 
-// Sync all contacts
-app.post('/api/sync/all', authCheck, async (req, res) => {
-    if (sessionStatus !== 'connected') {
-        return res.status(503).json({ error: 'WhatsApp not connected' });
-    }
-    
-    const limit = req.body.limit || 100;
-    
-    // Run in background to avoid timeout
-    syncAllContacts(limit).then(result => {
-        console.log('[Sync] Background sync completed:', result);
-        io.emit('sync_completed', result);
-    }).catch(console.error);
-    
-    res.json({ 
-        success: true, 
-        message: 'Sync started in background. Check sync_log table for progress.' 
-    });
-});
-
-// Sync recent contacts
-app.post('/api/sync/recent', authCheck, async (req, res) => {
-    if (sessionStatus !== 'connected') {
-        return res.status(503).json({ error: 'WhatsApp not connected' });
-    }
-    
-    const limit = req.body.limit || 30;
-    const result = await syncRecentContacts(limit);
-    res.json(result);
-});
-
-// Get sync status
-app.get('/api/sync/status', authCheck, async (req, res) => {
-    const [lastSync] = await db.query(
-        'SELECT * FROM whatsapp_sync_log ORDER BY last_sync_at DESC LIMIT 1'
-    );
-    
-    const [totalMessages] = await db.query(
-        'SELECT COUNT(*) as total FROM whatsapp_messages'
-    );
-    
-    const [totalContacts] = await db.query(
-        'SELECT COUNT(*) as total FROM whatsapp_contacts'
-    );
-    
-    res.json({
-        syncing: syncInProgress,
-        last_sync: lastSync[0] || null,
-        total_messages: totalMessages[0].total,
-        total_contacts: totalContacts[0].total
-    });
-});
-
-// Get conversations
+// Get conversations list
 app.get('/api/conversations', authCheck, async (req, res) => {
     try {
         const [conversations] = await db.query(`
@@ -521,18 +417,16 @@ app.get('/api/conversations', authCheck, async (req, res) => {
                 wc.customer_id,
                 wc.last_message,
                 wc.last_message_at,
-                (
-                    SELECT COUNT(*) 
-                    FROM whatsapp_messages 
-                    WHERE contact_id = wc.id 
-                    AND direction = 'incoming' 
-                    AND is_read = 0
-                ) as unread_count
+                (SELECT COUNT(*) FROM whatsapp_messages 
+                 WHERE contact_id = wc.id AND direction = 'incoming' AND is_read = 0) as unread_count,
+                (SELECT status FROM whatsapp_conversations 
+                 WHERE contact_id = wc.id ORDER BY started_at DESC LIMIT 1) as conversation_status
             FROM whatsapp_contacts wc
             WHERE wc.last_message_at IS NOT NULL
             ORDER BY wc.last_message_at DESC
             LIMIT 100
         `);
+        
         res.json(conversations);
     } catch (err) {
         console.error('Conversations error:', err.message);
@@ -563,66 +457,153 @@ app.get('/api/messages/:contactId', authCheck, async (req, res) => {
     }
 });
 
-// Send message
-app.post('/send', authCheck, async (req, res) => {
-    if (sessionStatus !== 'connected') {
-        return res.status(503).json({ error: 'WhatsApp not connected' });
-    }
-    
-    const { phone, message, contact_id } = req.body;
-    if ((!phone && !contact_id) || !message) {
-        return res.status(400).json({ error: 'phone or contact_id, and message are required' });
-    }
-    
+// Get contact details
+app.get('/api/contact/:contactId', authCheck, async (req, res) => {
     try {
-        let phoneNumber = phone;
+        const [contacts] = await db.query(`
+            SELECT wc.*, 
+                   c.name as customer_name,
+                   c.email as customer_email
+            FROM whatsapp_contacts wc
+            LEFT JOIN your_customers_table c ON wc.customer_id = c.id
+            WHERE wc.id = ?
+        `, [req.params.contactId]);
         
-        if (contact_id && !phone) {
-            const [contacts] = await db.query(
-                'SELECT phone_number FROM whatsapp_contacts WHERE id = ?',
-                [contact_id]
-            );
-            if (contacts.length === 0) {
-                return res.status(404).json({ error: 'Contact not found' });
-            }
-            phoneNumber = contacts[0].phone_number;
+        if (contacts.length === 0) {
+            return res.status(404).json({ error: 'Contact not found' });
         }
         
-        const cleanPhone = phoneNumber.replace(/\D/g, '');
-        const jid = cleanPhone + '@s.whatsapp.net';
-        
-        const result = await sock.sendMessage(jid, { text: message });
-        
-        const contact = await getOrCreateContact(cleanPhone);
-        await saveMessageToDB(contact.id, result.key.id, message, 'outgoing', result);
-        
-        io.emit('message_sent', {
-            contact_id: contact.id,
-            phone_number: cleanPhone,
-            message: message,
-            direction: 'outgoing',
-            timestamp: new Date()
-        });
-        
-        res.json({ success: true, to: jid, contact_id: contact.id });
+        res.json(contacts[0]);
     } catch (err) {
-        console.error('Send error:', err.message);
+        console.error('Contact error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Assign conversation to staff
+app.post('/api/assign', authCheck, async (req, res) => {
+    const { contact_id, staff_id } = req.body;
+    
+    try {
+        // Check if conversation exists
+        const [conv] = await db.query(
+            `SELECT id FROM whatsapp_conversations 
+             WHERE contact_id = ? AND status IN ('new', 'auto_replied')`,
+            [contact_id]
+        );
+        
+        if (conv.length === 0) {
+            // Create new conversation
+            await db.query(
+                `INSERT INTO whatsapp_conversations (contact_id, assigned_to, status, started_at) 
+                 VALUES (?, ?, 'active', NOW())`,
+                [contact_id, staff_id]
+            );
+        } else {
+            // Update existing conversation
+            await db.query(
+                `UPDATE whatsapp_conversations 
+                 SET assigned_to = ?, status = 'active' 
+                 WHERE contact_id = ?`,
+                [staff_id, contact_id]
+            );
+        }
+        
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Assign error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get auto-reply rules
+app.get('/api/auto-reply-rules', authCheck, async (req, res) => {
+    try {
+        const [rules] = await db.query(
+            'SELECT * FROM whatsapp_auto_reply_rules ORDER BY priority ASC'
+        );
+        res.json(rules);
+    } catch (err) {
+        console.error('Auto-reply rules error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Create/Update auto-reply rule
+app.post('/api/auto-reply-rules', authCheck, async (req, res) => {
+    const { trigger_type, trigger_value, reply_message, priority, is_active } = req.body;
+    
+    try {
+        await db.query(
+            `INSERT INTO whatsapp_auto_reply_rules 
+             (trigger_type, trigger_value, reply_message, priority, is_active) 
+             VALUES (?, ?, ?, ?, ?)`,
+            [trigger_type, trigger_value, reply_message, priority || 0, is_active !== false]
+        );
+        
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Create rule error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete auto-reply rule
+app.delete('/api/auto-reply-rules/:id', authCheck, async (req, res) => {
+    try {
+        await db.query('DELETE FROM whatsapp_auto_reply_rules WHERE id = ?', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Delete rule error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
 // Logout
 app.post('/logout', authCheck, async (req, res) => {
-    try { if (sock) await sock.logout(); } catch (_) {}
-    if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    try { 
+        if (sock) await sock.logout(); 
+    } catch (_) {}
+    
+    if (fs.existsSync(AUTH_DIR)) {
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    }
+    
     sessionStatus = 'disconnected';
     currentQR = null;
     sock = null;
     isConnecting = false;
     retryCount = 0;
-    syncInProgress = false;
+    
     setTimeout(() => connectToWhatsApp(), 1000);
-    res.json({ success: true, message: 'Logged out' });
+    res.json({ success: true, message: 'Logged out. New QR will be generated.' });
+});
+
+// ─── Socket.io Connection Handling ─────────────────────────────────────────
+io.on('connection', (socket) => {
+    console.log('[Socket] Client connected:', socket.id);
+    
+    socket.on('authenticate', (token) => {
+        if (token === API_SECRET) {
+            socket.authenticated = true;
+            socket.emit('authenticated', { status: 'success' });
+            console.log('[Socket] Client authenticated');
+        } else {
+            socket.emit('authenticated', { status: 'error', message: 'Invalid token' });
+            socket.disconnect();
+        }
+    });
+    
+    socket.on('join_conversation', (contactId) => {
+        if (socket.authenticated) {
+            socket.join(`conv_${contactId}`);
+            console.log(`[Socket] Client joined conversation ${contactId}`);
+        }
+    });
+    
+    socket.on('disconnect', () => {
+        console.log('[Socket] Client disconnected:', socket.id);
+    });
 });
 
 // ─── Baileys WhatsApp Connection ───────────────────────────────────────────
@@ -636,7 +617,9 @@ async function connectToWhatsApp() {
     if (isConnecting) return;
     isConnecting = true;
 
-    if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+    if (!fs.existsSync(AUTH_DIR)) {
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+    }
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -683,12 +666,6 @@ async function connectToWhatsApp() {
                 retryCount = 0;
                 console.log('[WA] Connected!');
                 io.emit('whatsapp_status', { status: 'connected' });
-                
-                // Auto-sync recent messages after connection
-                setTimeout(async () => {
-                    console.log('[WA] Auto-syncing recent messages...');
-                    await syncRecentContacts(20);
-                }, 5000);
             }
 
             if (connection === 'close') {
@@ -698,12 +675,15 @@ async function connectToWhatsApp() {
                 io.emit('whatsapp_status', { status: 'disconnected', code });
 
                 if (code === DisconnectReason.loggedOut) {
-                    if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    if (fs.existsSync(AUTH_DIR)) {
+                        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    }
                     sessionStatus = 'disconnected';
                     currentQR = null;
                     retryCount = 0;
                     setTimeout(() => connectToWhatsApp(), 3000);
                 } else {
+                    sessionStatus = 'disconnected';
                     const delay = getRetryDelay();
                     console.log(`[WA] Reconnecting in ${delay / 1000}s...`);
                     setTimeout(() => connectToWhatsApp(), delay);
@@ -711,7 +691,7 @@ async function connectToWhatsApp() {
             }
         });
 
-        // Handle incoming messages in real-time
+        // Handle incoming messages
         sock.ev.on('messages.upsert', async ({ messages }) => {
             for (const msg of messages) {
                 // Skip messages we sent
@@ -722,34 +702,38 @@ async function connectToWhatsApp() {
                                  msg.message?.extendedTextMessage?.text || 
                                  msg.message?.imageMessage?.caption || '';
                 
-                if (!messageText && msg.message?.imageMessage) {
-                    messageText = '📷 Image';
-                } else if (!messageText && msg.message?.videoMessage) {
-                    messageText = '🎥 Video';
-                } else if (!messageText && msg.message?.audioMessage) {
-                    messageText = '🎵 Audio';
-                }
-                
                 if (!messageText) continue;
                 
                 const phoneNumber = msg.key.remoteJid.split('@')[0];
+                
                 console.log(`[WA] Message from ${phoneNumber}: ${messageText.substring(0, 50)}`);
                 
                 // Get or create contact
                 const contact = await getOrCreateContact(phoneNumber);
                 
                 // Save incoming message
-                const timestamp = msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000) : new Date();
-                await saveMessageToDB(contact.id, msg.key.id, messageText, 'incoming', msg, timestamp);
+                const messageId = await saveMessage(contact.id, messageText, 'incoming', msg);
                 
-                // Emit real-time message
-                io.emit('new_message', {
+                // Emit real-time message to connected clients
+                io.to(`conv_${contact.id}`).emit('new_message', {
+                    id: messageId,
                     contact_id: contact.id,
                     phone_number: phoneNumber,
                     message: messageText,
                     direction: 'incoming',
-                    timestamp: timestamp
+                    timestamp: new Date()
                 });
+                
+                // Broadcast to all clients (for inbox updates)
+                io.emit('inbox_update', {
+                    contact_id: contact.id,
+                    last_message: messageText,
+                    last_message_at: new Date(),
+                    unread_count: 1
+                });
+                
+                // Process auto-reply
+                await checkAndProcessAutoReply(contact.id, phoneNumber, messageText);
             }
         });
 
@@ -761,41 +745,9 @@ async function connectToWhatsApp() {
     }
 }
 
-// ─── Socket.io Connection Handling ─────────────────────────────────────────
-io.on('connection', (socket) => {
-    console.log('[Socket] Client connected:', socket.id);
-    
-    socket.on('authenticate', (token) => {
-        if (token === API_SECRET) {
-            socket.authenticated = true;
-            socket.emit('authenticated', { status: 'success' });
-            console.log('[Socket] Client authenticated');
-        } else {
-            socket.emit('authenticated', { status: 'error', message: 'Invalid token' });
-            socket.disconnect();
-        }
-    });
-    
-    socket.on('join_conversation', (contactId) => {
-        if (socket.authenticated) {
-            socket.join(`conv_${contactId}`);
-            console.log(`[Socket] Client joined conversation ${contactId}`);
-        }
-    });
-    
-    socket.on('disconnect', () => {
-        console.log('[Socket] Client disconnected:', socket.id);
-    });
-});
-
 // ─── Start Server ──────────────────────────────────────────────────────────
 async function startServer() {
-    console.log('[Server] Starting WhatsApp service...');
-    console.log('[Server] Environment:');
-    console.log(`  PORT: ${PORT}`);
-    console.log(`  DB_HOST: ${DB_CONFIG.host}`);
-    console.log(`  DB_NAME: ${DB_CONFIG.database}`);
-    
+    // Initialize database first
     const dbConnected = await initDatabase();
     
     if (!dbConnected) {
