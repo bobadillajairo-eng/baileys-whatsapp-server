@@ -38,6 +38,10 @@ const historyStore = {};
 let totalStored    = 0;
 let totalSkipped   = 0;
 
+// ─── Keep-alive timer ──────────────────────────────────────────────────────
+let lastPingTime = Date.now();
+let pingCount = 0;
+
 function extractBody(msg) {
     const m = msg.message;
     if (!m) return null;
@@ -66,46 +70,28 @@ function extractType(msg) {
     return 'text';
 }
 
-// ─── Improved Phone Number Formatter ───────────────────────────────────────
+// Improved phone number formatter
 function formatPhoneNumber(rawJid) {
     try {
-        // Remove @s.whatsapp.net if present
         let phone = rawJid.replace('@s.whatsapp.net', '');
-        
-        // Remove any non-digit characters
         let digits = phone.replace(/[^0-9]/g, '');
         
-        // If empty, return original
         if (!digits) return rawJid;
         
-        // WhatsApp numbers can be in various formats:
-        // - 521234567890 (Mexico with country code)
-        // - 1234567890 (without country code)
-        // - 521234567890@s.whatsapp.net (full JID)
-        // - +521234567890 (with plus)
-        
-        // Remove any leading zeros
         digits = digits.replace(/^0+/, '');
         
-        // If the number is 10 digits (Mexico local without country code), add +52
         if (digits.length === 10) {
             digits = '52' + digits;
         }
         
-        // If the number is 11 digits and starts with 52, it's Mexico format
-        // If it's 12 digits or more, it might have extra digits - trim to reasonable length
         if (digits.length > 13) {
-            // WhatsApp numbers are typically max 13 digits with country code
-            // Try to extract the last 10-13 digits
             digits = digits.slice(-13);
         }
         
-        // If digits start with 52 but no plus, add plus
         if (digits.startsWith('52')) {
             return '+' + digits;
         }
         
-        // Add plus sign for all numbers
         return '+' + digits;
     } catch (error) {
         console.error('[WA] Phone formatting error:', error);
@@ -144,8 +130,6 @@ function storeMessage(phone, msg) {
 async function sendToPHPWebhook(messageData) {
     try {
         console.log(`[Webhook] Sending to: ${PHP_WEBHOOK_URL}`);
-        console.log(`[Webhook] Data:`, JSON.stringify(messageData).substring(0, 300));
-        
         const response = await axios.post(PHP_WEBHOOK_URL, messageData, {
             headers: {
                 'Content-Type': 'application/json',
@@ -160,7 +144,6 @@ async function sendToPHPWebhook(messageData) {
         console.error(`[Webhook] ERROR:`, error.message);
         if (error.response) {
             console.error(`[Webhook] Response status: ${error.response.status}`);
-            console.error(`[Webhook] Response data:`, error.response.data);
         }
         return false;
     }
@@ -242,6 +225,58 @@ function authCheck(req, res, next) {
 }
 
 // ─── Routes ────────────────────────────────────────────────────────────────
+
+// Keep-alive / ping endpoint - no authentication required
+app.get('/ping', (req, res) => {
+    lastPingTime = Date.now();
+    pingCount++;
+    
+    res.json({ 
+        status: 'alive', 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        ping_count: pingCount,
+        whatsapp_status: sessionStatus,
+        memory: {
+            rss: Math.round(process.memoryUsage().rss / 1024 / 1024) + ' MB',
+            heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + ' MB',
+            heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
+        }
+    });
+});
+
+// Simple status endpoint without authentication (for quick checks)
+app.get('/simple-status', (req, res) => {
+    res.json({ 
+        status: sessionStatus,
+        connected: sessionStatus === 'connected',
+        uptime: process.uptime(),
+        last_ping: new Date(lastPingTime).toISOString(),
+        ping_count: pingCount,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Root endpoint for quick check
+app.get('/', (req, res) => {
+    res.json({ 
+        service: 'Baileys WhatsApp Service',
+        status: sessionStatus,
+        version: '1.0.0',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        endpoints: {
+            health: '/health',
+            status: '/status',
+            ping: '/ping',
+            simple_status: '/simple-status',
+            qr: '/qr',
+            send: '/send (POST)',
+            send_bulk: '/send-bulk (POST)'
+        }
+    });
+});
+
 app.get('/health', (req, res) => {
     res.json({
         status:       'ok',
@@ -251,6 +286,8 @@ app.get('/health', (req, res) => {
         stored_msgs:  totalStored,
         skipped_msgs: totalSkipped,
         webhook_url:  PHP_WEBHOOK_URL,
+        uptime:       process.uptime(),
+        ping_count:   pingCount
     });
 });
 
@@ -451,7 +488,6 @@ async function connectToWhatsApp() {
                 if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
                 if (!msg.message) continue;
 
-                // Format phone number using improved formatter
                 const formattedPhone = formatPhoneNumber(jid);
                 const fromMe = msg.key?.fromMe || false;
                 
@@ -460,7 +496,6 @@ async function connectToWhatsApp() {
 
                 storeMessage(formattedPhone, msg);
 
-                // Process inbound messages (not from me)
                 if (type === 'notify' && !fromMe) {
                     const body = extractBody(msg);
                     if (!body) continue;
@@ -480,7 +515,6 @@ async function connectToWhatsApp() {
                     if (messageQueue.length > 200) messageQueue = messageQueue.slice(-200);
                     console.log(`[WA] Inbound from ${formattedPhone}: ${body.substring(0, 50)}`);
 
-                    // Send to PHP webhook with formatted phone number
                     const webhookData = {
                         message: {
                             id: msg.key.id,
@@ -496,7 +530,6 @@ async function connectToWhatsApp() {
                     await sendToPHPWebhook(webhookData);
                 }
                 
-                // Log outgoing messages from WhatsApp Web
                 if (type === 'notify' && fromMe) {
                     const body = extractBody(msg);
                     if (body) {
@@ -558,11 +591,31 @@ async function connectToWhatsApp() {
     }
 }
 
+// ─── Self-ping to prevent sleep (if deployed on Railway) ───────────────────
+if (process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT) {
+    const selfPing = async () => {
+        try {
+            const response = await axios.get(`http://localhost:${PORT}/ping`);
+            console.log(`[Self-ping] Keep-alive ping sent - Status: ${response.status}`);
+        } catch (err) {
+            console.error(`[Self-ping] Failed:`, err.message);
+        }
+    };
+    
+    // Ping every 4 minutes
+    setInterval(selfPing, 240000);
+    console.log('[Self-ping] Enabled - pinging every 4 minutes');
+}
+
 // ─── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`[Server] Running on port ${PORT}`);
     console.log(`[Server] Webhook URL: ${PHP_WEBHOOK_URL}`);
     console.log(`[Server] API Secret: ${API_SECRET.substring(0, 10)}...`);
-    console.log(`[Server] Phone format: International format with country code (+521234567890)`);
+    console.log(`[Server] Keep-alive endpoints:`);
+    console.log(`  GET  /ping        - Keep-alive ping (no auth)`);
+    console.log(`  GET  /simple-status - Quick status check (no auth)`);
+    console.log(`  GET  /health      - Health check (requires auth)`);
+    console.log(`  GET  /status      - WhatsApp status (requires auth)`);
     connectToWhatsApp();
 });
